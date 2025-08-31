@@ -52,17 +52,21 @@ def _send_discord_webhook(content: str):
 def _send_discord_bot_message(content: str):
     import urllib.error
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
-    data = json.dumps({"content": content, "allowed_mentions": {"parse": ["users"]}}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": "ShowdownStartsBot (https://github.com/your-repo, 1.0)",
-        }
-    )
+    data = json.dumps({
+        "content": content,
+        "allowed_mentions": {"parse": ["users"]}
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, */*",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+        "User-Agent": "ShowdownStartsBot (https://github.com/your-repo, 1.0)",
+    }
+
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             resp = r.read().decode()
@@ -72,8 +76,6 @@ def _send_discord_bot_message(content: str):
         print(f"[discord] bot HTTPError {e.code} {body}", file=sys.stderr)
         raise
 
-
-
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         _respond(self, 200, {"ok": True, "message": "showdown webhook up"})
@@ -82,7 +84,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             print("[step] incoming POST /api/showdown")
 
-            # 1) Shared secret (optional but recommended)
+            # 1) Shared secret
             if SHARED_SECRET:
                 hdr = self.headers.get("X-Shared-Secret", "")
                 if hdr != SHARED_SECRET:
@@ -90,7 +92,7 @@ class handler(BaseHTTPRequestHandler):
                     _respond(self, 401, {"error": "unauthorized"})
                     return
 
-            # 2) Parse JSON body
+            # 2) Parse body
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             if self.headers.get("Content-Transfer-Encoding") == "base64":
@@ -111,7 +113,6 @@ class handler(BaseHTTPRequestHandler):
 
             p1 = data["playerOne"]
             p2 = data["playerTwo"]
-            started_at = data["startedAt"]
 
             # 4) Resolve mentions
             id1 = _lookup_discord_id(p1) or ""
@@ -120,7 +121,7 @@ class handler(BaseHTTPRequestHandler):
 
             m1 = f"<@{id1}>" if id1 else p1
             m2 = f"<@{id2}>" if id2 else p2
-            content = f"🎮 **Showdown started!**\n{m1} vs {m2}\n🕒 {started_at}"
+            content = f"🎮 **New game started! gl&hf**\n{m1} vs {m2}"
             print("[step] message content ready")
 
             # 5) Send to Discord
