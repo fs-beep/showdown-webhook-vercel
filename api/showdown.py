@@ -60,7 +60,7 @@ def _send_discord_bot_message(content: str):
         headers={
             "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
             "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://github.com/your-repo, 1.0)",
+            "User-Agent": "ShowdownStartsBot (https://github.com/your-repo, 1.0)",
         }
     )
     try:
