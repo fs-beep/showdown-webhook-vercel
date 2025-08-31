@@ -58,7 +58,7 @@ def _send_discord_bot_message(content: str):
         "Accept": "application/json, */*",
         "Accept-Encoding": "identity",
         "Connection": "close",
-        "User-Agent": "MatchAlerter (https://github.com/your-repo, 1.0)",
+        "User-Agent": "MatchNotifier (https://github.com/your-repo, 1.0)",
     }
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
