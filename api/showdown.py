@@ -96,7 +96,7 @@ class handler(BaseHTTPRequestHandler):
 
             m1 = f"<@{id1}>" if id1 else p1
             m2 = f"<@{id2}>" if id2 else p2
-            content = f"🎮 **New game started!**\n{m1} vs {m2}"
+            content = f"🎮 New game started!\n{m1} vs {m2}"
             print("[step] message content ready")
 
             use_webhook = bool(DISCORD_WEBHOOK)
