@@ -3,7 +3,7 @@
 # Handles Discord Interactions (slash commands) on Vercel.
 # Provides: /link playername:<string>  -> stores mapping playername -> user_id in Upstash Redis.
 from http.server import BaseHTTPRequestHandler
-import os, json, hmac, hashlib, time, urllib.request
+import os, json, hmac, hashlib, time, urllib.request, urllib.parse
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
@@ -17,19 +17,21 @@ PONG = 1
 CHANNEL_MESSAGE_WITH_SOURCE = 4
 EPHEMERAL = 1 << 6
 
-def upstash_set(playername: str, user_id: str):
-    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+def upstash_set(playername: str, user_id: str) -> bool:
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if not (url and token):
         return False
     key = f"playerlink:{playername.strip().lower()}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    payload = {"cmd": f'SET {key} {user_id}'}
+    # Build: <url>/set/<key>/<value>, URL-encoding parts
+    full = f"{url}/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(user_id, safe='')}"
+    req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
-        req = urllib.request.Request(UPSTASH_REDIS_REST_URL, data=json.dumps(payload).encode("utf-8"),
-                                     headers=headers, method="POST")
-        urllib.request.urlopen(req, timeout=5).read()
+        urllib.request.urlopen(req, timeout=6).read()
         return True
     except Exception:
         return False
+
 
 class handler(BaseHTTPRequestHandler):
     def _respond_raw(self, status=200, body=b"", headers=None):
