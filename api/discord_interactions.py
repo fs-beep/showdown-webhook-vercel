@@ -1,36 +1,41 @@
-
 # api/discord_interactions.py
-# Handles Discord Interactions (slash commands) on Vercel.
-# Provides: /link playername:<string>  -> stores mapping playername -> user_id in Upstash Redis.
+# Handles Discord Interactions (slash commands). Provides: /link playername:<string>
 from http.server import BaseHTTPRequestHandler
-import os, json, hmac, hashlib, time, urllib.request, urllib.parse
+import os, json, hmac, hashlib, urllib.request, urllib.parse, sys, traceback
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
-DISCORD_PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY", "")
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+def _clean(v: str) -> str:
+    return (v or "").strip().strip('"').strip("'")
 
-APPLICATION_COMMAND = 2
-PING = 1
-PONG = 1
-CHANNEL_MESSAGE_WITH_SOURCE = 4
+DISCORD_PUBLIC_KEY = _clean(os.getenv("DISCORD_PUBLIC_KEY", ""))  # required
+UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
+UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
+
+PING  = 1
+PONG  = 1
+APP_CMD = 2
+CH_MSG = 4
 EPHEMERAL = 1 << 6
 
+def respond_json(handler, obj, status=200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.end_headers()
+    handler.wfile.write(json.dumps(obj).encode("utf-8"))
+
+def respond_ephemeral(content: str):
+    return {"type": CH_MSG, "data": {"content": content, "flags": EPHEMERAL}}
+
 def upstash_set(playername: str, user_id: str) -> bool:
-    import os, urllib.parse, urllib.request, json, sys, traceback
-    # sanitize envs to strip accidental quotes/spaces
-    def clean(v): 
-        return (v or "").strip().strip('"').strip("'")
-    url   = clean(os.getenv("UPSTASH_REDIS_REST_URL"))
-    token = clean(os.getenv("UPSTASH_REDIS_REST_TOKEN"))
-    if not (url and token):
-        print(f"[upstash] missing URL or TOKEN (url={repr(url)}, token_len={len(token)})", file=sys.stderr)
+    """Save playername -> discord_user_id in Upstash using path-style REST."""
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        print(f"[upstash] missing URL or TOKEN (url={repr(UPSTASH_URL)}, token_len={len(UPSTASH_TOKEN)})", file=sys.stderr)
         return False
     key  = f"playerlink:{playername.strip().lower()}"
-    full = f"{url}/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(user_id, safe='')}"
+    full = f"{UPSTASH_URL}/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(user_id, safe='')}"
     try:
-        req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(full, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
         with urllib.request.urlopen(req, timeout=6) as r:
             body = r.read().decode("utf-8")
             print(f"[upstash] SET {key} -> {body}")
@@ -39,55 +44,41 @@ def upstash_set(playername: str, user_id: str) -> bool:
         print("[upstash] SET failed:\n" + traceback.format_exc(), file=sys.stderr)
         return False
 
-
+def verify_signature(body: bytes, sig: str, ts: str) -> bool:
+    try:
+        vk = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+        vk.verify(ts.encode() + body, bytes.fromhex(sig))
+        return True
+    except Exception:
+        return False
 
 class handler(BaseHTTPRequestHandler):
-    def _respond_raw(self, status=200, body=b"", headers=None):
-        self.send_response(status)
-        for k, v in (headers or {"Content-Type":"application/json"}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _respond_json(self, obj, status=200):
-        self._respond_raw(status, json.dumps(obj).encode("utf-8"), {"Content-Type":"application/json"})
-
     def do_POST(self):
-        # Verify request signature (ed25519)
-        signature = self.headers.get("X-Signature-Ed25519")
-        timestamp = self.headers.get("X-Signature-Timestamp")
-        body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
-        try:
-            verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
-            verify_key.verify(f"{timestamp}".encode()+body, bytes.fromhex(signature))
-        except Exception:
-            return self._respond_json({"error":"bad signature"}, 401)
+        # Verify request from Discord (ed25519)
+        sig = self.headers.get("X-Signature-Ed25519", "")
+        ts  = self.headers.get("X-Signature-Timestamp", "")
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+        if not (sig and ts and verify_signature(raw, sig, ts)):
+            return respond_json(self, {"error": "bad signature"}, 401)
 
-        data = json.loads(body.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
         t = data.get("type")
 
         if t == PING:
-            return self._respond_json({"type": PONG})
+            return respond_json(self, {"type": PONG})
 
-        if t == APPLICATION_COMMAND:
+        if t == APP_CMD:
             name = data["data"]["name"]
-            user = data["member"]["user"]
-            user_id = user["id"]
+            user = data.get("member", {}).get("user") or data.get("user", {})
+            user_id = user.get("id", "")
             if name == "link":
-                # option: playername
-                opts = {o["name"]:o["value"] for o in data["data"].get("options",[])}
-                playername = opts.get("playername")
+                opts = {o["name"]: o["value"] for o in data["data"].get("options", [])}
+                playername = opts.get("playername", "")
                 if not playername or not isinstance(playername, str):
-                    return self._respond_json({
-                        "type": CHANNEL_MESSAGE_WITH_SOURCE,
-                        "data": {"content": "Usage: /link playername:<text>", "flags": EPHEMERAL}
-                    })
+                    return respond_json(self, respond_ephemeral("Usage: /link playername:<text>"))
                 ok = upstash_set(playername, user_id)
                 msg = f"Linked **{playername}** to <@{user_id}> ✅" if ok else "Failed to save mapping ❌"
-                return self._respond_json({
-                    "type": CHANNEL_MESSAGE_WITH_SOURCE,
-                    "data": {"content": msg, "flags": EPHEMERAL}
-                })
+                return respond_json(self, respond_ephemeral(msg))
 
-        # Default
-        return self._respond_json({"type": CHANNEL_MESSAGE_WITH_SOURCE, "data": {"content":"Unsupported", "flags": EPHEMERAL}})
+        # Fallback
+        return respond_json(self, respond_ephemeral("Unsupported interaction"))
