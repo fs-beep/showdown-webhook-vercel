@@ -19,25 +19,26 @@ EPHEMERAL = 1 << 6
 
 def upstash_set(playername: str, user_id: str) -> bool:
     import os, urllib.parse, urllib.request, json, sys, traceback
-    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
-    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    # sanitize envs to strip accidental quotes/spaces
+    def clean(v): 
+        return (v or "").strip().strip('"').strip("'")
+    url   = clean(os.getenv("UPSTASH_REDIS_REST_URL"))
+    token = clean(os.getenv("UPSTASH_REDIS_REST_TOKEN"))
     if not (url and token):
-        print("[upstash] missing URL or TOKEN", file=sys.stderr)
+        print(f"[upstash] missing URL or TOKEN (url={repr(url)}, token_len={len(token)})", file=sys.stderr)
         return False
-
-    key = f"playerlink:{playername.strip().lower()}"
+    key  = f"playerlink:{playername.strip().lower()}"
     full = f"{url}/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(user_id, safe='')}"
-
     try:
         req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=6) as r:
             body = r.read().decode("utf-8")
             print(f"[upstash] SET {key} -> {body}")
-            ok = json.loads(body).get("result") == "OK"
-            return ok
+            return json.loads(body).get("result") == "OK"
     except Exception:
         print("[upstash] SET failed:\n" + traceback.format_exc(), file=sys.stderr)
         return False
+
 
 
 class handler(BaseHTTPRequestHandler):
