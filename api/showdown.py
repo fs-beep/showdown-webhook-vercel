@@ -26,18 +26,24 @@ def _send_discord_bot_message(content: str):
     _http_json("POST", url, {"content": content, "allowed_mentions": {"parse": ["users"]}}, headers=headers)
 
 def _lookup_discord_id(player_name: str):
-    import os, urllib.parse, urllib.request, json
+    import os, urllib.parse, urllib.request, json, sys
     url = os.getenv("UPSTASH_REDIS_REST_URL", "")
     token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     if not (url and token):
+        print("[upstash] missing URL or TOKEN for GET", file=sys.stderr)
         return None
     key = f"playerlink:{player_name.strip().lower()}"
     full = f"{url}/get/{urllib.parse.quote(key, safe='')}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"}), timeout=6) as r:
-            return json.loads(r.read().decode("utf-8")).get("result")
-    except Exception:
+        req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            body = r.read().decode("utf-8")
+            print(f"[upstash] GET {key} -> {body}")
+            return json.loads(body).get("result")
+    except Exception as e:
+        print(f"[upstash] GET failed: {e}", file=sys.stderr)
         return None
+
 
 class handler(BaseHTTPRequestHandler):
     def _respond(self, status=200, body=None):
