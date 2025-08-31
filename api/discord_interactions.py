@@ -1,8 +1,8 @@
 # api/discord_interactions.py
-# Discord Interactions handler: /link, /whois, /unlink, /me
+# Discord Interactions handler: /link, /whois, /unlink
 from http.server import BaseHTTPRequestHandler
 import os, json, urllib.request, urllib.parse, sys
-from nacl.signing import VerifyKey  # requires PyNaCl
+from nacl.signing import VerifyKey
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
@@ -56,11 +56,27 @@ def u_del(key: str):
     except: return False
 
 # --- Link storage ---
-def save_link(playername: str, user_id: str, display_name: str, username: str) -> bool:
+def save_link(playername: str, user_id: str, display_name: str, username: str):
+    """
+    Enforces 1-to-1 mapping:
+      - A Discord user can only link one playername.
+      - A playername can only be linked to one Discord user.
+    """
     player_norm = playername.strip()
     player_lc   = player_norm.lower()
     uname_lc    = (username or "").strip().lower()
 
+    # check if this user already has a link
+    existing_player = u_get(f"userlink:{user_id}")
+    if existing_player:
+        return False, f"You already linked to **{existing_player}**. Unlink first."
+
+    # check if this playername is already taken
+    existing = u_get(f"playerlink:{player_lc}")
+    if existing:
+        return False, f"Player **{player_norm}** is already linked to another Discord account."
+
+    # keys
     player_key = f"playerlink:{player_lc}"
     user_key   = f"userlink:{user_id}"
     uname_key  = f"usernamelink:{uname_lc}" if uname_lc else None
@@ -74,22 +90,16 @@ def save_link(playername: str, user_id: str, display_name: str, username: str) -
     ok &= u_set(user_key, player_norm)
     if uname_key: ok &= u_set(uname_key, player_norm)
     ok &= u_set(meta_key, meta_blob)
-    return ok
+    return ok, f"Linked **{player_norm}** to <@{user_id}> ✅"
 
 def read_player_link(playername: str):
     player_lc = playername.strip().lower()
     raw = u_get(f"playerlink:{player_lc}")
     if not raw: return None
-    if isinstance(raw,str) and raw and raw[0] != "{":  # old plain ID
+    if isinstance(raw,str) and raw and raw[0] != "{":
         return {"id": raw, "username": None, "display": None, "player": playername}
     try:
         blob = json.loads(raw); blob["player"] = playername; return blob
-    except: return None
-
-def read_user_link(user_id: str):
-    raw = u_get(f"usermeta:{user_id}")
-    if not raw: return None
-    try: return json.loads(raw)
     except: return None
 
 def delete_player_link(playername: str):
@@ -127,13 +137,14 @@ class handler(BaseHTTPRequestHandler):
             display_name = member.get("nick") or user.get("global_name") or username or f"User {user_id}"
             perms = int(member.get("permissions","0") or "0")
 
+            # /link
             if cmd == "link":
                 playername = str(options.get("playername","")).strip()
                 if not playername: return respond_json(self, ephemeral("Usage: /link playername:<text>"))
-                ok = save_link(playername, user_id, display_name, username)
-                msg = f"Linked **{playername}** to <@{user_id}> ✅" if ok else "Failed to save mapping ❌"
+                ok, msg = save_link(playername, user_id, display_name, username)
                 return respond_json(self, ephemeral(msg))
 
+            # /whois
             if cmd == "whois":
                 playername = str(options.get("playername","")).strip()
                 if not playername: return respond_json(self, ephemeral("Usage: /whois playername:<text>"))
@@ -143,6 +154,7 @@ class handler(BaseHTTPRequestHandler):
                 msg = f"**{playername}** → <@{uid}>  •  username: `{uname}`  •  display: `{disp}`"
                 return respond_json(self, ephemeral(msg))
 
+            # /unlink
             if cmd == "unlink":
                 playername = str(options.get("playername","")).strip()
                 if not playername: return respond_json(self, ephemeral("Usage: /unlink playername:<text>"))
@@ -153,12 +165,5 @@ class handler(BaseHTTPRequestHandler):
                     return respond_json(self, ephemeral("You can only unlink your own mapping (or be an admin)."))
                 delete_player_link(playername)
                 return respond_json(self, ephemeral(f"Unlinked **{playername}** ✅"))
-
-            if cmd == "me":
-                info = read_user_link(user_id)
-                if not info: return respond_json(self, ephemeral("You don’t have any linked player name."))
-                player = info.get("player"); uname = info.get("username") or "(no username)"; disp = info.get("display") or "(no display)"
-                msg = f"Your account <@{user_id}> is linked to **{player}**  •  username: `{uname}`  •  display: `{disp}`"
-                return respond_json(self, ephemeral(msg))
 
         return respond_json(self, ephemeral("Unsupported interaction"))
