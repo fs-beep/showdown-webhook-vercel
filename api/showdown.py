@@ -26,16 +26,16 @@ def _send_discord_bot_message(content: str):
     _http_json("POST", url, {"content": content, "allowed_mentions": {"parse": ["users"]}}, headers=headers)
 
 def _lookup_discord_id(player_name: str):
-    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+    import os, urllib.parse, urllib.request, json
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if not (url and token):
         return None
-    # Use case-insensitive key
     key = f"playerlink:{player_name.strip().lower()}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    payload = {"cmd": f'GET {key}'}
+    full = f"{url}/get/{urllib.parse.quote(key, safe='')}"
     try:
-        res = _http_json("POST", UPSTASH_REDIS_REST_URL, payload, headers=headers)
-        # Upstash returns {"result":"<id>"} or {"result":null}
-        return res.get("result")
+        with urllib.request.urlopen(urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"}), timeout=6) as r:
+            return json.loads(r.read().decode("utf-8")).get("result")
     except Exception:
         return None
 
