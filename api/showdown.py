@@ -54,10 +54,13 @@ def _send_discord_bot_message(content: str):
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
     data = json.dumps({"content": content, "allowed_mentions": {"parse": ["users"]}}).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data, method="POST",
+        url,
+        data=data,
+        method="POST",
         headers={
             "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
             "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/your-repo, 1.0)",
         }
     )
     try:
@@ -68,6 +71,7 @@ def _send_discord_bot_message(content: str):
         body = e.read().decode(errors="replace")
         print(f"[discord] bot HTTPError {e.code} {body}", file=sys.stderr)
         raise
+
 
 
 class handler(BaseHTTPRequestHandler):
