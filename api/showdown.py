@@ -21,9 +21,21 @@ def _send_discord_webhook(content: str):
     _http_json("POST", DISCORD_WEBHOOK, {"content": content})
 
 def _send_discord_bot_message(content: str):
-    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-    _http_json("POST", url, {"content": content, "allowed_mentions": {"parse": ["users"]}}, headers=headers)
+    import os, json, urllib.request
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    channel_id = os.getenv("DISCORD_CHANNEL_ID")
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    data = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=6) as r:
+        print(f"[discord] response {r.status} {r.read().decode()}")
+
 
 def _lookup_discord_id(player_name: str):
     import os, urllib.parse, urllib.request, json, sys
