@@ -24,8 +24,10 @@ def upstash_set(playername: str, user_id: str) -> bool:
     if not (url and token):
         print("[upstash] missing URL or TOKEN", file=sys.stderr)
         return False
+
     key = f"playerlink:{playername.strip().lower()}"
     full = f"{url}/set/{urllib.parse.quote(key, safe='')}/{urllib.parse.quote(user_id, safe='')}"
+
     try:
         req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=6) as r:
@@ -36,7 +38,6 @@ def upstash_set(playername: str, user_id: str) -> bool:
     except Exception:
         print("[upstash] SET failed:\n" + traceback.format_exc(), file=sys.stderr)
         return False
-
 
 
 class handler(BaseHTTPRequestHandler):
