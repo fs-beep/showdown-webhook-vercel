@@ -50,6 +50,7 @@ def _send_discord_webhook(content: str):
         print(f"[discord] webhook response {r.status} {resp}")
 
 def _send_discord_bot_message(content: str):
+    import urllib.error
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
     data = json.dumps({"content": content, "allowed_mentions": {"parse": ["users"]}}).encode("utf-8")
     req = urllib.request.Request(
@@ -59,9 +60,15 @@ def _send_discord_bot_message(content: str):
             "Content-Type": "application/json",
         }
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        resp = r.read().decode()
-        print(f"[discord] bot response {r.status} {resp}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = r.read().decode()
+            print(f"[discord] bot response {r.status} {resp}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"[discord] bot HTTPError {e.code} {body}", file=sys.stderr)
+        raise
+
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
