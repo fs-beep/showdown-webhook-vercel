@@ -27,12 +27,14 @@ def _send_discord_bot_message(content: str):
 
 def _lookup_discord_id(player_name: str):
     import os, urllib.parse, urllib.request, json, sys
-    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
-    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    def clean(v): 
+        return (v or "").strip().strip('"').strip("'")
+    url   = clean(os.getenv("UPSTASH_REDIS_REST_URL"))
+    token = clean(os.getenv("UPSTASH_REDIS_REST_TOKEN"))
     if not (url and token):
         print("[upstash] missing URL or TOKEN for GET", file=sys.stderr)
         return None
-    key = f"playerlink:{player_name.strip().lower()}"
+    key  = f"playerlink:{player_name.strip().lower()}"
     full = f"{url}/get/{urllib.parse.quote(key, safe='')}"
     try:
         req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
@@ -43,6 +45,7 @@ def _lookup_discord_id(player_name: str):
     except Exception as e:
         print(f"[upstash] GET failed: {e}", file=sys.stderr)
         return None
+
 
 
 class handler(BaseHTTPRequestHandler):
