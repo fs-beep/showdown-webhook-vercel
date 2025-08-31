@@ -1,10 +1,8 @@
 # api/discord_interactions.py
-# Discord Interactions handler: /link, /whois, /unlink
+# Discord Interactions handler: /link, /whois, /unlink, /me
 from http.server import BaseHTTPRequestHandler
 import os, json, urllib.request, urllib.parse, sys
-
 from nacl.signing import VerifyKey  # requires PyNaCl
-# ---- helpers ---------------------------------------------------------------
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
@@ -17,7 +15,7 @@ PING, PONG = 1, 1
 APP_CMD = 2
 CH_MSG = 4
 EPHEMERAL = 1 << 6
-ADMINISTRATOR = 0x00000008  # Discord permission bit
+ADMINISTRATOR = 0x00000008
 
 def respond_json(h, obj, status=200):
     h.send_response(status); h.send_header("Content-Type","application/json")
@@ -33,11 +31,8 @@ def verify_signature(body: bytes, sig_hex: str, ts: str) -> bool:
     except Exception:
         return False
 
-# ---- Upstash (path-style REST) --------------------------------------------
-
+# --- Upstash helpers ---
 def _u_req(path: str):
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        raise RuntimeError("Upstash env not set")
     req = urllib.request.Request(
         f"{UPSTASH_URL}{path}",
         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}
@@ -57,21 +52,11 @@ def u_get(key: str):
 def u_del(key: str):
     k = urllib.parse.quote(key, safe="")
     body = _u_req(f"/del/{k}"); print(f"[upstash] DEL {key} -> {body}")
-    # DEL returns number of keys removed; treat >0 as success
-    try:
-        return int(json.loads(body).get("result") or 0) > 0
-    except Exception:
-        return False
+    try: return int(json.loads(body).get("result") or 0) > 0
+    except: return False
 
-# ---- Link storage ----------------------------------------------------------
-
+# --- Link storage ---
 def save_link(playername: str, user_id: str, display_name: str, username: str) -> bool:
-    """Write 4 keys:
-      playerlink:<player_lc>     -> JSON {"id","username","display"}
-      userlink:<user_id>         -> <player_original_case>
-      usernamelink:<username_lc> -> <player_original_case>
-      usermeta:<user_id>         -> JSON {"username","display","player"}
-    """
     player_norm = playername.strip()
     player_lc   = player_norm.lower()
     uname_lc    = (username or "").strip().lower()
@@ -92,22 +77,22 @@ def save_link(playername: str, user_id: str, display_name: str, username: str) -
     return ok
 
 def read_player_link(playername: str):
-    """Return dict {"id","username","display","player"} or None."""
     player_lc = playername.strip().lower()
     raw = u_get(f"playerlink:{player_lc}")
     if not raw: return None
-    # Support old installs where value was plain ID
-    if isinstance(raw, str) and raw and raw[0] != "{":
+    if isinstance(raw,str) and raw and raw[0] != "{":  # old plain ID
         return {"id": raw, "username": None, "display": None, "player": playername}
     try:
-        blob = json.loads(raw)
-        blob["player"] = playername
-        return blob
-    except Exception:
-        return None
+        blob = json.loads(raw); blob["player"] = playername; return blob
+    except: return None
+
+def read_user_link(user_id: str):
+    raw = u_get(f"usermeta:{user_id}")
+    if not raw: return None
+    try: return json.loads(raw)
+    except: return None
 
 def delete_player_link(playername: str):
-    """Delete playerlink + reverse indices (if present)."""
     info = read_player_link(playername)
     player_lc = playername.strip().lower()
     removed = u_del(f"playerlink:{player_lc}")
@@ -117,8 +102,7 @@ def delete_player_link(playername: str):
         if uname: u_del(f"usernamelink:{uname}")
     return removed
 
-# ---- HTTP handler ----------------------------------------------------------
-
+# --- HTTP handler ---
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         sig = self.headers.get("X-Signature-Ed25519",""); ts = self.headers.get("X-Signature-Timestamp","")
@@ -126,10 +110,8 @@ class handler(BaseHTTPRequestHandler):
         if not (sig and ts and verify_signature(body, sig, ts)):
             return respond_json(self, {"error":"bad signature"}, 401)
 
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            return respond_json(self, {"error":"bad json"}, 400)
+        try: data = json.loads(body.decode("utf-8"))
+        except: return respond_json(self, {"error":"bad json"}, 400)
 
         if data.get("type") == PING:
             return respond_json(self, {"type": PONG})
@@ -145,42 +127,38 @@ class handler(BaseHTTPRequestHandler):
             display_name = member.get("nick") or user.get("global_name") or username or f"User {user_id}"
             perms = int(member.get("permissions","0") or "0")
 
-            # /link
             if cmd == "link":
                 playername = str(options.get("playername","")).strip()
-                if not playername:
-                    return respond_json(self, ephemeral("Usage: /link playername:<text>"))
+                if not playername: return respond_json(self, ephemeral("Usage: /link playername:<text>"))
                 ok = save_link(playername, user_id, display_name, username)
                 msg = f"Linked **{playername}** to <@{user_id}> ✅" if ok else "Failed to save mapping ❌"
                 return respond_json(self, ephemeral(msg))
 
-            # /whois
             if cmd == "whois":
                 playername = str(options.get("playername","")).strip()
-                if not playername:
-                    return respond_json(self, ephemeral("Usage: /whois playername:<text>"))
+                if not playername: return respond_json(self, ephemeral("Usage: /whois playername:<text>"))
                 info = read_player_link(playername)
-                if not info:
-                    return respond_json(self, ephemeral(f"**{playername}** is not linked."))
-                uid = info.get("id")
-                disp = info.get("display") or "(no display name)"
-                uname = info.get("username") or "(no username)"
+                if not info: return respond_json(self, ephemeral(f"**{playername}** is not linked."))
+                uid = info.get("id"); disp = info.get("display") or "(no display)"; uname = info.get("username") or "(no username)"
                 msg = f"**{playername}** → <@{uid}>  •  username: `{uname}`  •  display: `{disp}`"
                 return respond_json(self, ephemeral(msg))
 
-            # /unlink  (owner or admin only)
             if cmd == "unlink":
                 playername = str(options.get("playername","")).strip()
-                if not playername:
-                    return respond_json(self, ephemeral("Usage: /unlink playername:<text>"))
+                if not playername: return respond_json(self, ephemeral("Usage: /unlink playername:<text>"))
                 info = read_player_link(playername)
-                if not info:
-                    return respond_json(self, ephemeral(f"**{playername}** wasn’t linked."))
-                owner_id = info.get("id")
-                is_admin = (perms & ADMINISTRATOR) == ADMINISTRATOR
+                if not info: return respond_json(self, ephemeral(f"**{playername}** wasn’t linked."))
+                owner_id = info.get("id"); is_admin = (perms & ADMINISTRATOR)==ADMINISTRATOR
                 if user_id != owner_id and not is_admin:
                     return respond_json(self, ephemeral("You can only unlink your own mapping (or be an admin)."))
                 delete_player_link(playername)
                 return respond_json(self, ephemeral(f"Unlinked **{playername}** ✅"))
+
+            if cmd == "me":
+                info = read_user_link(user_id)
+                if not info: return respond_json(self, ephemeral("You don’t have any linked player name."))
+                player = info.get("player"); uname = info.get("username") or "(no username)"; disp = info.get("display") or "(no display)"
+                msg = f"Your account <@{user_id}> is linked to **{player}**  •  username: `{uname}`  •  display: `{disp}`"
+                return respond_json(self, ephemeral(msg))
 
         return respond_json(self, ephemeral("Unsupported interaction"))
