@@ -1,76 +1,80 @@
 # api/discord_interactions.py
-# Handles Discord Interactions (slash commands). Provides: /link playername:<string>
+# Discord Interactions handler: /link, /whois, /unlink
 from http.server import BaseHTTPRequestHandler
-import os, json, urllib.request, urllib.parse, sys, traceback
-from nacl.signing import VerifyKey   # pynacl
-from nacl.exceptions import BadSignatureError
+import os, json, urllib.request, urllib.parse, sys
+
+from nacl.signing import VerifyKey  # requires PyNaCl
+# ---- helpers ---------------------------------------------------------------
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
 
-DISCORD_PUBLIC_KEY = _clean(os.getenv("DISCORD_PUBLIC_KEY", ""))  # required
+DISCORD_PUBLIC_KEY = _clean(os.getenv("DISCORD_PUBLIC_KEY", ""))
 UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
 UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 
-# Discord interaction constants
-PING  = 1
-PONG  = 1
+PING, PONG = 1, 1
 APP_CMD = 2
 CH_MSG = 4
 EPHEMERAL = 1 << 6
+ADMINISTRATOR = 0x00000008  # Discord permission bit
 
-# ---------- small helpers ----------
-def _respond_json(h, obj, status=200):
-    h.send_response(status)
-    h.send_header("Content-Type", "application/json")
-    h.end_headers()
-    h.wfile.write(json.dumps(obj).encode("utf-8"))
+def respond_json(h, obj, status=200):
+    h.send_response(status); h.send_header("Content-Type","application/json")
+    h.end_headers(); h.wfile.write(json.dumps(obj).encode("utf-8"))
 
-def respond_ephemeral(content: str):
-    return {"type": CH_MSG, "data": {"content": content, "flags": EPHEMERAL}}
+def ephemeral(msg: str):
+    return {"type": CH_MSG, "data": {"content": msg, "flags": EPHEMERAL}}
 
 def verify_signature(body: bytes, sig_hex: str, ts: str) -> bool:
     try:
-        key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
-        key.verify(ts.encode() + body, bytes.fromhex(sig_hex))
+        VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY)).verify(ts.encode() + body, bytes.fromhex(sig_hex))
         return True
     except Exception:
         return False
 
-# ---------- Upstash helpers ----------
-def _u_request(path: str):
-    """Call Upstash REST using path-style URL, return (ok, body_str)."""
+# ---- Upstash (path-style REST) --------------------------------------------
+
+def _u_req(path: str):
     if not (UPSTASH_URL and UPSTASH_TOKEN):
-        return False, "missing Upstash env"
+        raise RuntimeError("Upstash env not set")
     req = urllib.request.Request(
         f"{UPSTASH_URL}{path}",
         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}
     )
     with urllib.request.urlopen(req, timeout=8) as r:
-        return True, r.read().decode("utf-8")
+        return r.read().decode("utf-8")
 
-def _u_set(key: str, value: str):
-    key_q = urllib.parse.quote(key, safe="")
-    val_q = urllib.parse.quote(value, safe="")
-    return _u_request(f"/set/{key_q}/{val_q}")
+def u_set(key: str, value: str):
+    k = urllib.parse.quote(key, safe=""); v = urllib.parse.quote(value, safe="")
+    body = _u_req(f"/set/{k}/{v}"); print(f"[upstash] SET {key} -> {body}"); return json.loads(body).get("result")=="OK"
 
-def upstash_save_link(playername: str, user_id: str, display_name: str, username: str) -> bool:
-    """
-    Writes four keys:
-      playerlink:<player>      -> JSON {"id","username","display"}
-      userlink:<discord_id>    -> <player>
-      usernamelink:<username>  -> <player>   (username lowercased)
-      usermeta:<discord_id>    -> JSON {"username","display","player"}
-    """
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        print("[upstash] missing URL/TOKEN", file=sys.stderr)
+def u_get(key: str):
+    k = urllib.parse.quote(key, safe="")
+    body = _u_req(f"/get/{k}"); print(f"[upstash] GET {key} -> {body}")
+    return json.loads(body).get("result")
+
+def u_del(key: str):
+    k = urllib.parse.quote(key, safe="")
+    body = _u_req(f"/del/{k}"); print(f"[upstash] DEL {key} -> {body}")
+    # DEL returns number of keys removed; treat >0 as success
+    try:
+        return int(json.loads(body).get("result") or 0) > 0
+    except Exception:
         return False
 
+# ---- Link storage ----------------------------------------------------------
+
+def save_link(playername: str, user_id: str, display_name: str, username: str) -> bool:
+    """Write 4 keys:
+      playerlink:<player_lc>     -> JSON {"id","username","display"}
+      userlink:<user_id>         -> <player_original_case>
+      usernamelink:<username_lc> -> <player_original_case>
+      usermeta:<user_id>         -> JSON {"username","display","player"}
+    """
     player_norm = playername.strip()
-    if not player_norm:
-        return False
-    player_lc = player_norm.lower()
-    uname_lc  = (username or "").strip().lower()
+    player_lc   = player_norm.lower()
+    uname_lc    = (username or "").strip().lower()
 
     player_key = f"playerlink:{player_lc}"
     user_key   = f"userlink:{user_id}"
@@ -80,67 +84,103 @@ def upstash_save_link(playername: str, user_id: str, display_name: str, username
     player_blob = json.dumps({"id": user_id, "username": username, "display": display_name})
     meta_blob   = json.dumps({"username": username, "display": display_name, "player": player_norm})
 
-    ok1, b1 = _u_set(player_key, player_blob)
-    print(f"[upstash] SET {player_key} -> {b1}")
+    ok = True
+    ok &= u_set(player_key, player_blob)
+    ok &= u_set(user_key, player_norm)
+    if uname_key: ok &= u_set(uname_key, player_norm)
+    ok &= u_set(meta_key, meta_blob)
+    return ok
 
-    ok2, b2 = _u_set(user_key, player_norm)
-    print(f"[upstash] SET {user_key} -> {b2}")
+def read_player_link(playername: str):
+    """Return dict {"id","username","display","player"} or None."""
+    player_lc = playername.strip().lower()
+    raw = u_get(f"playerlink:{player_lc}")
+    if not raw: return None
+    # Support old installs where value was plain ID
+    if isinstance(raw, str) and raw and raw[0] != "{":
+        return {"id": raw, "username": None, "display": None, "player": playername}
+    try:
+        blob = json.loads(raw)
+        blob["player"] = playername
+        return blob
+    except Exception:
+        return None
 
-    if uname_key:
-        ok3, b3 = _u_set(uname_key, player_norm)
-        print(f"[upstash] SET {uname_key} -> {b3}")
-    else:
-        ok3 = True
+def delete_player_link(playername: str):
+    """Delete playerlink + reverse indices (if present)."""
+    info = read_player_link(playername)
+    player_lc = playername.strip().lower()
+    removed = u_del(f"playerlink:{player_lc}")
+    if info:
+        uid = info.get("id"); uname = (info.get("username") or "").strip().lower()
+        if uid:   u_del(f"userlink:{uid}"); u_del(f"usermeta:{uid}")
+        if uname: u_del(f"usernamelink:{uname}")
+    return removed
 
-    ok4, b4 = _u_set(meta_key, meta_blob)
-    print(f"[upstash] SET {meta_key} -> {b4}")
+# ---- HTTP handler ----------------------------------------------------------
 
-    return ok1 and ok2 and ok3 and ok4
-
-# ---------- HTTP handler ----------
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # 1) Verify Discord signature
-        sig = self.headers.get("X-Signature-Ed25519", "")
-        ts  = self.headers.get("X-Signature-Timestamp", "")
-        body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+        sig = self.headers.get("X-Signature-Ed25519",""); ts = self.headers.get("X-Signature-Timestamp","")
+        body = self.rfile.read(int(self.headers.get("Content-Length","0") or 0))
         if not (sig and ts and verify_signature(body, sig, ts)):
-            return _respond_json(self, {"error": "bad signature"}, 401)
+            return respond_json(self, {"error":"bad signature"}, 401)
 
-        # 2) Parse interaction
         try:
             data = json.loads(body.decode("utf-8"))
         except Exception:
-            return _respond_json(self, {"error": "bad json"}, 400)
+            return respond_json(self, {"error":"bad json"}, 400)
 
-        # PING / health check
         if data.get("type") == PING:
-            return _respond_json(self, {"type": PONG})
+            return respond_json(self, {"type": PONG})
 
         if data.get("type") == APP_CMD:
-            cmd = data.get("data", {}).get("name", "")
-            # Pull user info (try member->nick/global_name first; fall back to username)
+            cmd = (data.get("data") or {}).get("name","")
+            options = {o["name"]: o["value"] for o in (data.get("data") or {}).get("options", [])}
+
             member = data.get("member", {}) or {}
             user   = member.get("user") or data.get("user") or {}
-            user_id = user.get("id", "")
+            user_id = user.get("id","")
+            username = user.get("username","")
+            display_name = member.get("nick") or user.get("global_name") or username or f"User {user_id}"
+            perms = int(member.get("permissions","0") or "0")
 
-            display_name = (
-                member.get("nick")
-                or user.get("global_name")
-                or user.get("username")
-                or f"User {user_id}"
-            )
-            username = user.get("username", "")
-
+            # /link
             if cmd == "link":
-                opts = {o["name"]: o["value"] for o in data.get("data", {}).get("options", [])}
-                playername = str(opts.get("playername", "")).strip()
+                playername = str(options.get("playername","")).strip()
                 if not playername:
-                    return _respond_json(self, respond_ephemeral("Usage: /link playername:<text>"))
-
-                ok = upstash_save_link(playername, user_id, display_name, username)
+                    return respond_json(self, ephemeral("Usage: /link playername:<text>"))
+                ok = save_link(playername, user_id, display_name, username)
                 msg = f"Linked **{playername}** to <@{user_id}> ✅" if ok else "Failed to save mapping ❌"
-                return _respond_json(self, respond_ephemeral(msg))
+                return respond_json(self, ephemeral(msg))
 
-        # Fallback
-        return _respond_json(self, respond_ephemeral("Unsupported interaction"))
+            # /whois
+            if cmd == "whois":
+                playername = str(options.get("playername","")).strip()
+                if not playername:
+                    return respond_json(self, ephemeral("Usage: /whois playername:<text>"))
+                info = read_player_link(playername)
+                if not info:
+                    return respond_json(self, ephemeral(f"**{playername}** is not linked."))
+                uid = info.get("id")
+                disp = info.get("display") or "(no display name)"
+                uname = info.get("username") or "(no username)"
+                msg = f"**{playername}** → <@{uid}>  •  username: `{uname}`  •  display: `{disp}`"
+                return respond_json(self, ephemeral(msg))
+
+            # /unlink  (owner or admin only)
+            if cmd == "unlink":
+                playername = str(options.get("playername","")).strip()
+                if not playername:
+                    return respond_json(self, ephemeral("Usage: /unlink playername:<text>"))
+                info = read_player_link(playername)
+                if not info:
+                    return respond_json(self, ephemeral(f"**{playername}** wasn’t linked."))
+                owner_id = info.get("id")
+                is_admin = (perms & ADMINISTRATOR) == ADMINISTRATOR
+                if user_id != owner_id and not is_admin:
+                    return respond_json(self, ephemeral("You can only unlink your own mapping (or be an admin)."))
+                delete_player_link(playername)
+                return respond_json(self, ephemeral(f"Unlinked **{playername}** ✅"))
+
+        return respond_json(self, ephemeral("Unsupported interaction"))
