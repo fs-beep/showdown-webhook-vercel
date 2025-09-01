@@ -1,5 +1,5 @@
 # api/showdown.py
-# Posts "New game started!" when at least one player is linked.
+# Posts "New game started!" for every match.
 # Linked players are tagged; unlinked are shown as their in-game name.
 from http.server import BaseHTTPRequestHandler
 import json, os, base64, urllib.request, urllib.parse, sys, traceback
@@ -72,7 +72,7 @@ def _send_discord_bot_message(content: str):
         "Accept": "application/json, */*",
         "Accept-Encoding": "identity",
         "Connection": "close",
-        # Use your bot's real name in UA (helps with CF)
+        # Use your bot's real name in UA
         "User-Agent": "MatchNotifier (https://github.com/your-repo, 1.0)",
     }
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
@@ -93,7 +93,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             print("[step] incoming POST /api/showdown")
 
-            # 1) Shared secret (optional)
+            # 1) Shared secret check
             if SHARED_SECRET:
                 hdr = self.headers.get("X-Shared-Secret", "")
                 if hdr != SHARED_SECRET:
@@ -113,7 +113,7 @@ class handler(BaseHTTPRequestHandler):
                 return
             print(f"[step] parsed body: {data}")
 
-            # 3) Validate types (strings)
+            # 3) Validate
             for k in ("playerOne", "playerTwo", "startedAt"):
                 if k not in data or not isinstance(data[k], str):
                     _respond(self, 400, {"error": f"missing or invalid '{k}'"})
@@ -122,26 +122,18 @@ class handler(BaseHTTPRequestHandler):
             p1 = data["playerOne"].strip()
             p2 = data["playerTwo"].strip()
 
-            # 4) Resolve mentions (IDs may be None)
+            # 4) Resolve IDs (may be None)
             id1 = _lookup_discord_id(p1)
             id2 = _lookup_discord_id(p2)
-            linked1 = bool(id1)
-            linked2 = bool(id2)
             print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
 
-            # 5) Only post if at least one is linked
-            if not (linked1 or linked2):
-                print("[step] skipping post: no linked players")
-                _respond(self, 200, {"ok": True, "sent_via": None, "skipped": "no_linked_players"})
-                return
-
-            # Build message: linked → mention, unlinked → plain name
-            m1 = f"<@{id1}>" if linked1 else p1
-            m2 = f"<@{id2}>" if linked2 else p2
+            # 5) Always build message
+            m1 = f"<@{id1}>" if id1 else p1
+            m2 = f"<@{id2}>" if id2 else p2
             content = f"🎮 New game started! {m1} vs {m2}"
             print("[step] message content ready")
 
-            # 6) Send to Discord (webhook preferred if set)
+            # 6) Send to Discord
             use_webhook = bool(DISCORD_WEBHOOK)
             use_bot = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
             print(f"[discord] config webhook={use_webhook} bot={use_bot} chan={DISCORD_CHANNEL_ID}")
