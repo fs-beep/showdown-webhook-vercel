@@ -1,10 +1,13 @@
 # api/showdown.py
+# Posts "New game started!" when at least one player is linked.
+# Linked players are tagged; unlinked are shown as their in-game name.
 from http.server import BaseHTTPRequestHandler
 import json, os, base64, urllib.request, urllib.parse, sys, traceback
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
 
+# ---- Env
 DISCORD_WEBHOOK    = _clean(os.getenv("DISCORD_WEBHOOK", ""))
 DISCORD_BOT_TOKEN  = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
 DISCORD_CHANNEL_ID = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
@@ -13,13 +16,18 @@ UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET      = _clean(os.getenv("SHARED_SECRET", ""))
 
 def _respond(h, status=200, obj=None):
-    h.send_response(status); h.send_header("Content-Type","application/json"); h.end_headers()
+    h.send_response(status)
+    h.send_header("Content-Type", "application/json")
+    h.end_headers()
     h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
 
+# ---- Upstash lookup
 def _lookup_discord_id(player_name: str):
+    """Return Discord ID if linked; supports JSON value or plain string. Else None."""
     key = f"playerlink:{player_name.strip().lower()}"
     if not (UPSTASH_URL and UPSTASH_TOKEN):
-        print("[upstash] missing URL or TOKEN for GET", file=sys.stderr); return None
+        print("[upstash] missing URL or TOKEN for GET", file=sys.stderr)
+        return None
     full = f"{UPSTASH_URL}/get/{urllib.parse.quote(key, safe='')}"
     try:
         req = urllib.request.Request(full, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
@@ -29,24 +37,30 @@ def _lookup_discord_id(player_name: str):
             result = json.loads(body).get("result")
             if not result:
                 return None
-            # Accept either plain ID or JSON blob with "id"
+            # JSON blob case
             if isinstance(result, str) and result.startswith("{"):
                 try:
                     return json.loads(result).get("id")
                 except Exception:
                     return None
+            # legacy: plain ID string
             if isinstance(result, str):
                 return result
             return None
     except Exception as e:
-        print(f"[upstash] GET failed: {e}", file=sys.stderr); return None
+        print(f"[upstash] GET failed: {e}", file=sys.stderr)
+        return None
 
+# ---- Discord senders
 def _send_discord_webhook(content: str):
     data = json.dumps({"content": content, "allowed_mentions": {"parse": ["users"]}}).encode("utf-8")
-    req = urllib.request.Request(DISCORD_WEBHOOK, data=data, method="POST",
-                                 headers={"Content-Type":"application/json"})
+    req = urllib.request.Request(
+        DISCORD_WEBHOOK, data=data, method="POST",
+        headers={"Content-Type": "application/json"}
+    )
     with urllib.request.urlopen(req, timeout=10) as r:
-        resp = r.read().decode(); print(f"[discord] webhook response {r.status} {resp}")
+        resp = r.read().decode()
+        print(f"[discord] webhook response {r.status} {resp}")
 
 def _send_discord_bot_message(content: str):
     import urllib.error
@@ -58,14 +72,18 @@ def _send_discord_bot_message(content: str):
         "Accept": "application/json, */*",
         "Accept-Encoding": "identity",
         "Connection": "close",
+        # Use your bot's real name in UA (helps with CF)
         "User-Agent": "MatchNotifier (https://github.com/your-repo, 1.0)",
     }
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            resp = r.read().decode(); print(f"[discord] bot response {r.status} {resp}")
+            resp = r.read().decode()
+            print(f"[discord] bot response {r.status} {resp}")
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace"); print(f"[discord] bot HTTPError {e.code} {body}", file=sys.stderr); raise
+        body = e.read().decode(errors="replace")
+        print(f"[discord] bot HTTPError {e.code} {body}", file=sys.stderr)
+        raise
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -74,45 +92,79 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             print("[step] incoming POST /api/showdown")
+
+            # 1) Shared secret (optional)
             if SHARED_SECRET:
-                if self.headers.get("X-Shared-Secret","") != SHARED_SECRET:
-                    print("[error] bad shared secret", file=sys.stderr); _respond(self, 401, {"error":"unauthorized"}); return
-            length = int(self.headers.get("Content-Length","0") or 0)
+                hdr = self.headers.get("X-Shared-Secret", "")
+                if hdr != SHARED_SECRET:
+                    print("[error] bad shared secret", file=sys.stderr)
+                    _respond(self, 401, {"error": "unauthorized"})
+                    return
+
+            # 2) Parse JSON body
+            length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             if self.headers.get("Content-Transfer-Encoding") == "base64":
                 raw = base64.b64decode(raw)
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception:
-                _respond(self, 400, {"error": "invalid json"}); return
+                _respond(self, 400, {"error": "invalid json"})
+                return
             print(f"[step] parsed body: {data}")
-            for k in ("playerOne","playerTwo","startedAt"):
-                if k not in data or not isinstance(data[k], str):
-                    _respond(self, 400, {"error": f"missing or invalid '{k}'"}); return
 
-            p1, p2 = data["playerOne"], data["playerTwo"]
-            id1, id2 = _lookup_discord_id(p1) or "", _lookup_discord_id(p2) or ""
+            # 3) Validate types (strings)
+            for k in ("playerOne", "playerTwo", "startedAt"):
+                if k not in data or not isinstance(data[k], str):
+                    _respond(self, 400, {"error": f"missing or invalid '{k}'"})
+                    return
+
+            p1 = data["playerOne"].strip()
+            p2 = data["playerTwo"].strip()
+
+            # 4) Resolve mentions (IDs may be None)
+            id1 = _lookup_discord_id(p1)
+            id2 = _lookup_discord_id(p2)
+            linked1 = bool(id1)
+            linked2 = bool(id2)
             print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
 
-            m1 = f"<@{id1}>" if id1 else p1
-            m2 = f"<@{id2}>" if id2 else p2
-            content = f"🎮 New game started!\n{m1} vs {m2}"
+            # 5) Only post if at least one is linked
+            if not (linked1 or linked2):
+                print("[step] skipping post: no linked players")
+                _respond(self, 200, {"ok": True, "sent_via": None, "skipped": "no_linked_players"})
+                return
+
+            # Build message: linked → mention, unlinked → plain name
+            m1 = f"<@{id1}>" if linked1 else p1
+            m2 = f"<@{id2}>" if linked2 else p2
+            content = f"🎮 New game started! {m1} vs {m2}"
             print("[step] message content ready")
 
+            # 6) Send to Discord (webhook preferred if set)
             use_webhook = bool(DISCORD_WEBHOOK)
             use_bot = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
             print(f"[discord] config webhook={use_webhook} bot={use_bot} chan={DISCORD_CHANNEL_ID}")
 
             sent_via = None
             if use_webhook:
-                print("[discord] attempting webhook send"); _send_discord_webhook(content); sent_via="webhook"; print("[discord] posted via webhook")
+                print("[discord] attempting webhook send")
+                _send_discord_webhook(content)
+                sent_via = "webhook"
+                print("[discord] posted via webhook")
             elif use_bot:
                 print(f"[discord] attempting bot send to channel {DISCORD_CHANNEL_ID} (token_len={len(DISCORD_BOT_TOKEN)})")
-                _send_discord_bot_message(content); sent_via="bot"; print("[discord] posted via bot")
+                _send_discord_bot_message(content)
+                sent_via = "bot"
+                print("[discord] posted via bot")
             else:
                 print("[discord] no valid posting method configured", file=sys.stderr)
 
-            _respond(self, 200, {"ok": True, "sent_via": sent_via}); return
+            _respond(self, 200, {"ok": True, "sent_via": sent_via})
+            return
+
         except Exception:
-            tb = traceback.format_exc(); print("[fatal] showdown handler crashed:\n"+tb, file=sys.stderr)
-            _respond(self, 500, {"error":"crash"}); return
+            tb = traceback.format_exc()
+            print("[fatal] showdown handler crashed:\n" + tb, file=sys.stderr)
+            _respond(self, 500, {"error": "crash"})
+            return
