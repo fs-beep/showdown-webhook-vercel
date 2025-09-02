@@ -15,7 +15,7 @@ UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
 UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET      = _clean(os.getenv("SHARED_SECRET", ""))
 
-THREAD_AUTO_ARCHIVE_MIN = 30  # auto-archive duration for threads
+THREAD_AUTO_ARCHIVE_MIN = 60  # auto-archive duration for threads
 
 # ---- HTTP helpers
 def _respond(h, status=200, obj=None):
