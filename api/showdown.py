@@ -1,5 +1,5 @@
 # api/showdown.py
-# Webhook multiplexer: only run match-thread logic if service=="matchfound".
+# Webhook multiplexer: only run match-thread logic if service=="gamefound".
 from http.server import BaseHTTPRequestHandler
 import json, os, base64, urllib.request, urllib.parse, sys, traceback
 
@@ -138,7 +138,7 @@ class handler(BaseHTTPRequestHandler):
             except: return _respond(self, 400, {"error": "invalid json"})
 
             service = (data.get("service") or "").strip().lower()
-            if service != "matchfound":
+            if service != "gamefound":
                 return _respond(self, 200, {"ok": True, "skipped": f"service={service}"})
 
             p1 = (data.get("playerOne") or "").strip()
