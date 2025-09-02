@@ -1,5 +1,7 @@
 # api/showdown.py
-# Webhook multiplexer: only run match-thread logic if service=="gamefound".
+# Multiplexed webhook:
+# - service="gamefound": private thread per pair (reuse & unarchive). Skip if neither linked.
+# - service="queuestatus": maintain a single LFG message in a channel based on isLooking.
 from http.server import BaseHTTPRequestHandler
 import json, os, base64, urllib.request, urllib.parse, sys, traceback
 
@@ -7,20 +9,22 @@ def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
 
 # ---- Env
-DISCORD_BOT_TOKEN  = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
-DISCORD_CHANNEL_ID = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
-UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
-UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
-SHARED_SECRET      = _clean(os.getenv("SHARED_SECRET", ""))
+DISCORD_BOT_TOKEN      = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
+DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))       # parent text channel for gamefound threads
+DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))   # channel for auto-lfg state message
+UPSTASH_URL            = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
+UPSTASH_TOKEN          = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
+SHARED_SECRET          = _clean(os.getenv("SHARED_SECRET", ""))
+
+# Thread settings
+THREAD_AUTO_ARCHIVE_MIN = 60  # we'll fallback to 1440/4320/10080 if 60 is disallowed
 
 # ---- HTTP helpers
 def _respond(h, status=200, obj=None):
-    h.send_response(status)
-    h.send_header("Content-Type", "application/json")
-    h.end_headers()
-    h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
+    h.send_response(status); h.send_header("Content-Type", "application/json")
+    h.end_headers(); h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
 
-# ---- Upstash helpers
+# ---- Upstash (path-style REST) helpers
 def _u_req(path: str):
     req = urllib.request.Request(f"{UPSTASH_URL}{path}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
     with urllib.request.urlopen(req, timeout=8) as r:
@@ -34,6 +38,11 @@ def _u_get(key: str):
 def _u_set(key: str, val: str):
     k = urllib.parse.quote(key, safe=""); v = urllib.parse.quote(val, safe="")
     try: return json.loads(_u_req(f"/set/{k}/{v}")).get("result") == "OK"
+    except: return False
+
+def _u_del(key: str):
+    k = urllib.parse.quote(key, safe="")
+    try: return int(json.loads(_u_req(f"/del/{k}")).get("result") or 0) > 0
     except: return False
 
 # ---- Player -> Discord ID
@@ -56,6 +65,7 @@ def _bot_headers():
         "Content-Type": "application/json",
         "Accept": "application/json, */*",
         "User-Agent": "MatchNotifier (https://github.com/your-repo, 1.0)",
+        "Connection": "close",
     }
 
 def _discord_json(req, timeout=12):
@@ -64,33 +74,62 @@ def _discord_json(req, timeout=12):
         try: return json.loads(txt)
         except: return {}
 
+def _post_message(channel_id: str, content: str):
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    body = {"content": content, "allowed_mentions": {"parse": ["users"]}}
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST", headers=_bot_headers())
+    try:
+        obj = _discord_json(req)
+        print(f"[discord] posted in {channel_id}: {obj.get('id')}")
+        return obj
+    except urllib.error.HTTPError as e:
+        print(f"[discord] post HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        return None
+
+def _delete_message(channel_id: str, message_id: str):
+    import urllib.error
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
+    req = urllib.request.Request(url, method="DELETE", headers=_bot_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"[discord] delete {message_id} -> {r.status}")
+            return True
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"[discord] delete HTTPError {e.code} {body}", file=sys.stderr)
+        return e.code == 404  # already gone is fine
+
+# ---- Threads (create/unarchive/add)
 def _create_private_thread(name: str):
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/threads"
-    durations = [60, 1440, 4320, 10080]
+    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]  # try allowed values
     for dur in durations:
-        payload = {"name": name[:96], "type": 12, "auto_archive_duration": dur, "invitable": False}
+        payload = {"name": name[:96], "type": 12, "auto_archive_duration": int(dur), "invitable": False}
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                      method="POST", headers=_bot_headers())
         try:
             obj = _discord_json(req)
             if obj.get("id"):
+                print(f"[thread] created '{name}' -> {obj.get('id')} (dur={dur})")
                 return obj
         except urllib.error.HTTPError as e:
-            e.read()  # drain
+            print(f"[thread] create HTTPError {e.code} (dur={dur}) {e.read().decode(errors='replace')}", file=sys.stderr)
             continue
     return None
 
 def _ensure_unarchived(thread_id: str):
     url = f"https://discord.com/api/v10/channels/{thread_id}"
-    durations = [60, 1440, 4320, 10080]
+    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]
     for dur in durations:
-        payload = {"archived": False, "locked": False, "auto_archive_duration": dur}
+        payload = {"archived": False, "locked": False, "auto_archive_duration": int(dur)}
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                      method="PATCH", headers=_bot_headers())
         try:
-            _discord_json(req); return True
+            _discord_json(req)
+            print(f"[thread] unarchived {thread_id} (dur={dur})")
+            return True
         except urllib.error.HTTPError as e:
-            e.read()
+            print(f"[thread] unarchive HTTPError {e.code} (dur={dur}) {e.read().decode(errors='replace')}", file=sys.stderr)
             continue
     return False
 
@@ -99,80 +138,135 @@ def _add_thread_member(thread_id: str, user_id: str):
     url = f"https://discord.com/api/v10/channels/{thread_id}/thread-members/{user_id}"
     req = urllib.request.Request(url, method="PUT", headers=_bot_headers())
     try:
-        with urllib.request.urlopen(req, timeout=10): return True
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"[thread] add member {user_id} -> {r.status}")
+            return True
     except urllib.error.HTTPError as e:
-        e.read()
-        return e.code == 409  # already a member
-
-def _post_message(channel_id: str, content: str):
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    body = {"content": content, "allowed_mentions": {"parse": ["users"]}}
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 method="POST", headers=_bot_headers())
-    try: return _discord_json(req)
-    except urllib.error.HTTPError as e:
-        e.read()
-        return None
+        print(f"[thread] add member HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        return e.code == 409  # already a member is okay
 
 # ---- Pair key (order independent)
 def _pair_key(p1: str, p2: str) -> str:
     a, b = sorted([p1.strip().lower(), p2.strip().lower()])
     return f"threadpair:{a}|{b}"
 
+# ---- LFG helpers (one message acts as state)
+def _lfg_key(channel_id: str) -> str:
+    return f"lfgmsg:{channel_id}"
+
+def _ensure_lfg_message(channel_id: str, content: str = "Someone is looking for game!"):
+    # If key exists, assume it's there; if not, post and store id.
+    msg_id = _u_get(_lfg_key(channel_id))
+    if msg_id:
+        print(f"[lfg] exists {channel_id} -> {msg_id}")
+        return {"ok": True, "status": "exists", "message_id": msg_id}
+    obj = _post_message(channel_id, content)
+    if obj and obj.get("id"):
+        _u_set(_lfg_key(channel_id), obj["id"])
+        print(f"[lfg] created {channel_id} -> {obj['id']}")
+        return {"ok": True, "status": "created", "message_id": obj["id"]}
+    print("[lfg] failed to create", file=sys.stderr)
+    return {"ok": False, "status": "error"}
+
+def _clear_lfg_message(channel_id: str):
+    msg_id = _u_get(_lfg_key(channel_id))
+    if not msg_id:
+        print(f"[lfg] nothing to delete for channel {channel_id}")
+        return {"ok": True, "status": "nothing"}
+    if _delete_message(channel_id, msg_id):
+        _u_del(_lfg_key(channel_id))
+        print(f"[lfg] deleted {channel_id} -> {msg_id}")
+        return {"ok": True, "status": "deleted", "message_id": msg_id}
+    # If delete failed (non-404), keep the key so we can try later
+    print(f"[lfg] delete failed for {channel_id} -> {msg_id}", file=sys.stderr)
+    return {"ok": False, "status": "delete_failed", "message_id": msg_id}
+
+# ---- Request handler
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        _respond(self, 200, {"ok": True, "message": "showdown webhook up"})
+        _respond(self, 200, {"ok": True, "message": "webhook up"})
 
     def do_POST(self):
         try:
-            if SHARED_SECRET:
-                if self.headers.get("X-Shared-Secret", "") != SHARED_SECRET:
-                    return _respond(self, 401, {"error": "unauthorized"})
+            # Secret
+            if SHARED_SECRET and self.headers.get("X-Shared-Secret", "") != SHARED_SECRET:
+                return _respond(self, 401, {"error": "unauthorized"})
 
-            # Parse JSON
+            # Parse
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             if self.headers.get("Content-Transfer-Encoding") == "base64":
                 raw = base64.b64decode(raw)
-            try: data = json.loads(raw.decode("utf-8"))
-            except: return _respond(self, 400, {"error": "invalid json"})
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return _respond(self, 400, {"error": "invalid json"})
 
             service = (data.get("service") or "").strip().lower()
-            if service != "gamefound":
-                return _respond(self, 200, {"ok": True, "skipped": f"service={service}"})
 
-            p1 = (data.get("playerOne") or "").strip()
-            p2 = (data.get("playerTwo") or "").strip()
-            if not p1 or not p2:
-                return _respond(self, 400, {"error": "missing player names"})
+            # --- queuestatus -> auto-lfg channel state
+            if service == "queuestatus":
+                # Parse isLooking (accept boolean true, or strings "true","1","yes")
+                v = data.get("isLooking")
+                is_looking = False
+                if isinstance(v, bool):
+                    is_looking = v
+                elif isinstance(v, (int, float)):
+                    is_looking = (int(v) != 0)
+                elif isinstance(v, str):
+                    is_looking = v.strip().lower() in ("true", "1", "yes", "y")
 
-            id1, id2 = _lookup_discord_id(p1), _lookup_discord_id(p2)
-            if not (id1 or id2):
-                return _respond(self, 200, {"ok": True, "skipped": "no_linked_players"})
+                if not DISCORD_LFG_CHANNEL_ID:
+                    return _respond(self, 500, {"error": "DISCORD_LFG_CHANNEL_ID not set"})
 
-            m1 = f"<@{id1}>" if id1 else p1
-            m2 = f"<@{id2}>" if id2 else p2
-            content = f"🎮 New game started! {m1} vs {m2}"
+                if is_looking:
+                    res = _ensure_lfg_message(DISCORD_LFG_CHANNEL_ID)
+                    return _respond(self, 200, {"ok": True, "lfg": res})
+                else:
+                    res = _clear_lfg_message(DISCORD_LFG_CHANNEL_ID)
+                    return _respond(self, 200, {"ok": True, "lfg": res})
 
-            pair_key = _pair_key(p1, p2)
-            thread_id = _u_get(pair_key)
+            # --- gamefound -> private thread per pair (reuse & unarchive). Skip if neither linked.
+            if service == "gamefound":
+                p1 = (data.get("playerOne") or "").strip()
+                p2 = (data.get("playerTwo") or "").strip()
+                if not p1 or not p2:
+                    return _respond(self, 400, {"error": "missing player names"})
 
-            if thread_id and _ensure_unarchived(thread_id):
+                id1, id2 = _lookup_discord_id(p1), _lookup_discord_id(p2)
+                print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
+                if not (id1 or id2):
+                    return _respond(self, 200, {"ok": True, "skipped": "no_linked_players"})
+
+                # Build content and pair key
+                m1 = f"<@{id1}>" if id1 else p1
+                m2 = f"<@{id2}>" if id2 else p2
+                content = f"🎮 New game started! {m1} vs {m2}"
+                pair_key = _pair_key(p1, p2)
+
+                # Reuse thread if stored
+                thread_id = _u_get(pair_key)
+                if thread_id and _ensure_unarchived(thread_id):
+                    if id1: _add_thread_member(thread_id, id1)
+                    if id2: _add_thread_member(thread_id, id2)
+                    _post_message(thread_id, content)
+                    return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
+
+                # Create new private thread (requires DISCORD_CHANNEL_ID)
+                if not DISCORD_CHANNEL_ID:
+                    return _respond(self, 500, {"error": "DISCORD_CHANNEL_ID not set"})
+                th = _create_private_thread(f"{p1} vs {p2}")
+                if not th or not th.get("id"):
+                    return _respond(self, 500, {"error": "failed to create thread"})
+                thread_id = th["id"]
+                _u_set(pair_key, thread_id)
                 if id1: _add_thread_member(thread_id, id1)
                 if id2: _add_thread_member(thread_id, id2)
                 _post_message(thread_id, content)
-                return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
+                return _respond(self, 200, {"ok": True, "posted_in": "new_thread", "thread_id": thread_id})
 
-            th = _create_private_thread(f"{p1} vs {p2}")
-            if not th or not th.get("id"):
-                return _respond(self, 500, {"error": "failed to create thread"})
-            thread_id = th["id"]
-            _u_set(pair_key, thread_id)
-            if id1: _add_thread_member(thread_id, id1)
-            if id2: _add_thread_member(thread_id, id2)
-            _post_message(thread_id, content)
-
-            return _respond(self, 200, {"ok": True, "posted_in": "new_thread", "thread_id": thread_id})
+            # Unknown service -> skip, but 200 OK
+            return _respond(self, 200, {"ok": True, "skipped": f"service={service}"})
 
         except Exception:
             tb = traceback.format_exc()
