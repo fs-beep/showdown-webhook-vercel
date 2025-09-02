@@ -1,7 +1,8 @@
 # api/showdown.py
 # Multiplexed webhook:
-# - service="gamefound": private thread per pair (reuse & unarchive). Skip if neither linked.
-# - service="queuestatus": maintain a single LFG message in a channel based on isLooking.
+# - service == "queuestatus": maintain a single LFG message in DISCORD_LFG_CHANNEL_ID.
+# - anything else (or no service): run the match flow (private thread per pair, reuse & unarchive). Skip if neither linked.
+
 from http.server import BaseHTTPRequestHandler
 import json, os, base64, urllib.request, urllib.parse, sys, traceback
 
@@ -10,21 +11,20 @@ def _clean(v: str) -> str:
 
 # ---- Env
 DISCORD_BOT_TOKEN      = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
-DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))       # parent text channel for gamefound threads
-DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))   # channel for auto-lfg state message
+DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))       # parent channel for match threads
+DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))   # channel for auto-lfg state
 UPSTASH_URL            = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
 UPSTASH_TOKEN          = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET          = _clean(os.getenv("SHARED_SECRET", ""))
 
-# Thread settings
-THREAD_AUTO_ARCHIVE_MIN = 60  # we'll fallback to 1440/4320/10080 if 60 is disallowed
+THREAD_AUTO_ARCHIVE_MIN = 60  # will fall back to allowed values if needed
 
 # ---- HTTP helpers
 def _respond(h, status=200, obj=None):
     h.send_response(status); h.send_header("Content-Type", "application/json")
     h.end_headers(); h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
 
-# ---- Upstash (path-style REST) helpers
+# ---- Upstash (path-style REST)
 def _u_req(path: str):
     req = urllib.request.Request(f"{UPSTASH_URL}{path}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
     with urllib.request.urlopen(req, timeout=8) as r:
@@ -102,7 +102,7 @@ def _delete_message(channel_id: str, message_id: str):
 # ---- Threads (create/unarchive/add)
 def _create_private_thread(name: str):
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/threads"
-    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]  # try allowed values
+    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]  # allowed values fallback
     for dur in durations:
         payload = {"name": name[:96], "type": 12, "auto_archive_duration": int(dur), "invitable": False}
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
@@ -145,17 +145,16 @@ def _add_thread_member(thread_id: str, user_id: str):
         print(f"[thread] add member HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
         return e.code == 409  # already a member is okay
 
-# ---- Pair key (order independent)
+# ---- Pair key (order independent) for thread reuse
 def _pair_key(p1: str, p2: str) -> str:
     a, b = sorted([p1.strip().lower(), p2.strip().lower()])
     return f"threadpair:{a}|{b}"
 
-# ---- LFG helpers (one message acts as state)
+# ---- LFG helpers (single message acts as state)
 def _lfg_key(channel_id: str) -> str:
     return f"lfgmsg:{channel_id}"
 
 def _ensure_lfg_message(channel_id: str, content: str = "Someone is looking for game!"):
-    # If key exists, assume it's there; if not, post and store id.
     msg_id = _u_get(_lfg_key(channel_id))
     if msg_id:
         print(f"[lfg] exists {channel_id} -> {msg_id}")
@@ -177,7 +176,6 @@ def _clear_lfg_message(channel_id: str):
         _u_del(_lfg_key(channel_id))
         print(f"[lfg] deleted {channel_id} -> {msg_id}")
         return {"ok": True, "status": "deleted", "message_id": msg_id}
-    # If delete failed (non-404), keep the key so we can try later
     print(f"[lfg] delete failed for {channel_id} -> {msg_id}", file=sys.stderr)
     return {"ok": False, "status": "delete_failed", "message_id": msg_id}
 
@@ -204,9 +202,8 @@ class handler(BaseHTTPRequestHandler):
 
             service = (data.get("service") or "").strip().lower()
 
-            # --- queuestatus -> auto-lfg channel state
+            # --- Special case: queuestatus -> auto-lfg state message
             if service == "queuestatus":
-                # Parse isLooking (accept boolean true, or strings "true","1","yes")
                 v = data.get("isLooking")
                 is_looking = False
                 if isinstance(v, bool):
@@ -218,55 +215,49 @@ class handler(BaseHTTPRequestHandler):
 
                 if not DISCORD_LFG_CHANNEL_ID:
                     return _respond(self, 500, {"error": "DISCORD_LFG_CHANNEL_ID not set"})
+                res = _ensure_lfg_message(DISCORD_LFG_CHANNEL_ID) if is_looking else _clear_lfg_message(DISCORD_LFG_CHANNEL_ID)
+                return _respond(self, 200, {"ok": True, "lfg": res})
 
-                if is_looking:
-                    res = _ensure_lfg_message(DISCORD_LFG_CHANNEL_ID)
-                    return _respond(self, 200, {"ok": True, "lfg": res})
-                else:
-                    res = _clear_lfg_message(DISCORD_LFG_CHANNEL_ID)
-                    return _respond(self, 200, {"ok": True, "lfg": res})
+            # --- Default: match flow (behave as before)
+            p1 = (data.get("playerOne") or "").strip()
+            p2 = (data.get("playerTwo") or "").strip()
+            if not p1 or not p2:
+                return _respond(self, 400, {"error": "missing player names"})
 
-            # --- gamefound -> private thread per pair (reuse & unarchive). Skip if neither linked.
-            if service == "gamefound":
-                p1 = (data.get("playerOne") or "").strip()
-                p2 = (data.get("playerTwo") or "").strip()
-                if not p1 or not p2:
-                    return _respond(self, 400, {"error": "missing player names"})
+            id1, id2 = _lookup_discord_id(p1), _lookup_discord_id(p2)
+            print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
 
-                id1, id2 = _lookup_discord_id(p1), _lookup_discord_id(p2)
-                print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
-                if not (id1 or id2):
-                    return _respond(self, 200, {"ok": True, "skipped": "no_linked_players"})
+            # Skip if neither is linked (unchanged behavior)
+            if not (id1 or id2):
+                return _respond(self, 200, {"ok": True, "skipped": "no_linked_players"})
 
-                # Build content and pair key
-                m1 = f"<@{id1}>" if id1 else p1
-                m2 = f"<@{id2}>" if id2 else p2
-                content = f"🎮 New game started! {m1} vs {m2}"
-                pair_key = _pair_key(p1, p2)
+            # Build message & thread name
+            m1 = f"<@{id1}>" if id1 else p1
+            m2 = f"<@{id2}>" if id2 else p2
+            content = f"🎮 New game started! {m1} vs {m2}"
+            thread_name = f"{p1} vs {p2}"
 
-                # Reuse thread if stored
-                thread_id = _u_get(pair_key)
-                if thread_id and _ensure_unarchived(thread_id):
-                    if id1: _add_thread_member(thread_id, id1)
-                    if id2: _add_thread_member(thread_id, id2)
-                    _post_message(thread_id, content)
-                    return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
-
-                # Create new private thread (requires DISCORD_CHANNEL_ID)
-                if not DISCORD_CHANNEL_ID:
-                    return _respond(self, 500, {"error": "DISCORD_CHANNEL_ID not set"})
-                th = _create_private_thread(f"{p1} vs {p2}")
-                if not th or not th.get("id"):
-                    return _respond(self, 500, {"error": "failed to create thread"})
-                thread_id = th["id"]
-                _u_set(pair_key, thread_id)
+            # Reuse existing private thread if stored
+            pair_key = _pair_key(p1, p2)
+            thread_id = _u_get(pair_key)
+            if thread_id and _ensure_unarchived(thread_id):
                 if id1: _add_thread_member(thread_id, id1)
                 if id2: _add_thread_member(thread_id, id2)
                 _post_message(thread_id, content)
-                return _respond(self, 200, {"ok": True, "posted_in": "new_thread", "thread_id": thread_id})
+                return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
 
-            # Unknown service -> skip, but 200 OK
-            return _respond(self, 200, {"ok": True, "skipped": f"service={service}"})
+            # Create new private thread
+            if not DISCORD_CHANNEL_ID:
+                return _respond(self, 500, {"error": "DISCORD_CHANNEL_ID not set"})
+            th = _create_private_thread(thread_name)
+            if not th or not th.get("id"):
+                return _respond(self, 500, {"error": "failed to create thread"})
+            thread_id = th["id"]
+            _u_set(pair_key, thread_id)
+            if id1: _add_thread_member(thread_id, id1)
+            if id2: _add_thread_member(thread_id, id2)
+            _post_message(thread_id, content)
+            return _respond(self, 200, {"ok": True, "posted_in": "new_thread", "thread_id": thread_id})
 
         except Exception:
             tb = traceback.format_exc()
