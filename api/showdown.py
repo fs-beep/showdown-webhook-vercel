@@ -150,11 +150,30 @@ def _pair_key(p1: str, p2: str) -> str:
     a, b = sorted([p1.strip().lower(), p2.strip().lower()])
     return f"threadpair:{a}|{b}"
 
-# ---- LFG helpers (single message acts as state)
+# --- add near other env reads ---
+LFG_MESSAGE_TEXT = _clean(os.getenv("LFG_MESSAGE_TEXT", "Someone is looking for game!"))
+
+# --- add these helpers (or replace existing stubs) ---
+
+def _list_messages(channel_id: str, limit: int = 100, before: str | None = None):
+    """List messages in a channel (most recent first). Returns a list of message objects."""
+    qs = {"limit": str(min(max(limit, 1), 100))}
+    if before:
+        qs["before"] = before
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?{urllib.parse.urlencode(qs)}"
+    req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
+    try:
+        return _discord_json(req) or []
+    except urllib.error.HTTPError as e:
+        print(f"[lfg] list messages HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        return []
+
 def _lfg_key(channel_id: str) -> str:
     return f"lfgmsg:{channel_id}"
 
-def _ensure_lfg_message(channel_id: str, content: str = "Someone is looking for game!"):
+def _ensure_lfg_message(channel_id: str, content: str = None):
+    """Ensure a single LFG banner exists. If missing, create and store its ID."""
+    content = content or LFG_MESSAGE_TEXT
     msg_id = _u_get(_lfg_key(channel_id))
     if msg_id:
         print(f"[lfg] exists {channel_id} -> {msg_id}")
@@ -167,17 +186,40 @@ def _ensure_lfg_message(channel_id: str, content: str = "Someone is looking for 
     print("[lfg] failed to create", file=sys.stderr)
     return {"ok": False, "status": "error"}
 
-def _clear_lfg_message(channel_id: str):
-    msg_id = _u_get(_lfg_key(channel_id))
-    if not msg_id:
-        print(f"[lfg] nothing to delete for channel {channel_id}")
-        return {"ok": True, "status": "nothing"}
-    if _delete_message(channel_id, msg_id):
-        _u_del(_lfg_key(channel_id))
-        print(f"[lfg] deleted {channel_id} -> {msg_id}")
-        return {"ok": True, "status": "deleted", "message_id": msg_id}
-    print(f"[lfg] delete failed for {channel_id} -> {msg_id}", file=sys.stderr)
-    return {"ok": False, "status": "delete_failed", "message_id": msg_id}
+def _clear_lfg_message(channel_id: str, content: str = None):
+    """
+    Delete ALL instances of the LFG banner in the channel and clear the Redis pointer.
+    Scans up to 500 recent messages (5 pages x 100).
+    """
+    content = content or LFG_MESSAGE_TEXT
+
+    # 1) Try to delete the tracked one first (fast path)
+    tracked_id = _u_get(_lfg_key(channel_id))
+    if tracked_id:
+        _delete_message(channel_id, tracked_id)
+
+    # 2) Scan recent messages and delete any that match the banner text
+    MAX_PAGES = 5
+    before = None
+    total_deleted = 0
+    for _ in range(MAX_PAGES):
+        msgs = _list_messages(channel_id, limit=100, before=before)
+        if not msgs:
+            break
+        for m in msgs:
+            if (m.get("content") or "") == content:
+                if _delete_message(channel_id, m.get("id", "")):
+                    total_deleted += 1
+        # paginate
+        before = msgs[-1]["id"] if msgs else None
+        if not before:
+            break
+
+    # 3) Clear the pointer (even if we didn’t find any; it’s just a hint)
+    _u_del(_lfg_key(channel_id))
+    print(f"[lfg] deleted all occurrences: {total_deleted}")
+    return {"ok": True, "status": "deleted_all", "deleted": total_deleted}
+
 
 # ---- Request handler
 class handler(BaseHTTPRequestHandler):
