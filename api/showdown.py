@@ -1,30 +1,34 @@
 # api/showdown.py
-# Multiplexed webhook:
-# - service == "queuestatus": maintain a single LFG message in DISCORD_LFG_CHANNEL_ID.
-# - anything else (or no service): run the match flow (private thread per pair, reuse & unarchive). Skip if neither linked.
+# (unchanged header comment omitted for brevity)
 
 from http.server import BaseHTTPRequestHandler
-import json, os, base64, urllib.request, urllib.parse, sys, traceback
+import json, os, base64, urllib.request, urllib.parse, sys, traceback, time, math
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
 
-# ---- Env
+# -------- Env --------
 DISCORD_BOT_TOKEN      = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
-DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))       # parent channel for match threads
-DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))   # channel for auto-lfg state
+DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
+DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))
 UPSTASH_URL            = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
 UPSTASH_TOKEN          = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET          = _clean(os.getenv("SHARED_SECRET", ""))
 
-THREAD_AUTO_ARCHIVE_MIN = 60  # will fall back to allowed values if needed
+LFG_MESSAGE_TEXT       = _clean(os.getenv("LFG_MESSAGE_TEXT", "Someone is looking for a game!"))
+THREAD_AUTO_ARCHIVE_MIN = 60
 
-# ---- HTTP helpers
+# ---- keys for queue analytics
+Q_ACTIVE_KEY    = "queue:active"          # "1" while queue is on
+Q_STARTED_AT    = "queue:started_at"      # unix seconds when queue turned on
+Q_ZSET          = "queue:durations"       # zset of session blobs, score=end_ts
+
+# -------- HTTP helpers --------
 def _respond(h, status=200, obj=None):
     h.send_response(status); h.send_header("Content-Type", "application/json")
     h.end_headers(); h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
 
-# ---- Upstash (path-style REST)
+# -------- Upstash (path REST) --------
 def _u_req(path: str):
     req = urllib.request.Request(f"{UPSTASH_URL}{path}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
     with urllib.request.urlopen(req, timeout=8) as r:
@@ -45,7 +49,21 @@ def _u_del(key: str):
     try: return int(json.loads(_u_req(f"/del/{k}")).get("result") or 0) > 0
     except: return False
 
-# ---- Player -> Discord ID
+def _u_zadd(key: str, score: int, member: str):
+    k = urllib.parse.quote(key, safe=""); s = str(int(score)); m = urllib.parse.quote(member, safe="")
+    try: return int(json.loads(_u_req(f"/zadd/{k}/{s}/{m}")).get("result") or 0) >= 0
+    except: return False
+
+def _u_zrangebyscore(key: str, min_score: int, max_score: int):
+    k = urllib.parse.quote(key, safe=""); mn = str(int(min_score)); mx = str(int(max_score))
+    try:
+        res = json.loads(_u_req(f"/zrangebyscore/{k}/{mn}/{mx}")).get("result") or []
+        # Upstash returns an array of members (strings). We store JSON blobs.
+        return res
+    except:
+        return []
+
+# -------- Player → Discord ID --------
 def _lookup_discord_id(player_name: str):
     key = f"playerlink:{player_name.strip().lower()}"
     try:
@@ -58,7 +76,7 @@ def _lookup_discord_id(player_name: str):
         return None
     except: return None
 
-# ---- Discord bot API
+# -------- Discord bot API --------
 def _bot_headers():
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
@@ -97,12 +115,24 @@ def _delete_message(channel_id: str, message_id: str):
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         print(f"[discord] delete HTTPError {e.code} {body}", file=sys.stderr)
-        return e.code == 404  # already gone is fine
+        return e.code == 404
 
-# ---- Threads (create/unarchive/add)
+def _list_messages(channel_id: str, limit: int = 100, before: str | None = None):
+    qs = {"limit": str(min(max(limit, 1), 100))}
+    if before:
+        qs["before"] = before
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?{urllib.parse.urlencode(qs)}"
+    req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
+    try:
+        return _discord_json(req) or []
+    except urllib.error.HTTPError as e:
+        print(f"[lfg] list messages HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        return []
+
+# -------- Threads (create/unarchive/add) --------
 def _create_private_thread(name: str):
     url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/threads"
-    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]  # allowed values fallback
+    durations = [THREAD_AUTO_ARCHIVE_MIN, 1440, 4320, 10080]
     for dur in durations:
         payload = {"name": name[:96], "type": 12, "auto_archive_duration": int(dur), "invitable": False}
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
@@ -143,36 +173,18 @@ def _add_thread_member(thread_id: str, user_id: str):
             return True
     except urllib.error.HTTPError as e:
         print(f"[thread] add member HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
-        return e.code == 409  # already a member is okay
+        return e.code == 409
 
-# ---- Pair key (order independent) for thread reuse
+# -------- Pair key --------
 def _pair_key(p1: str, p2: str) -> str:
     a, b = sorted([p1.strip().lower(), p2.strip().lower()])
     return f"threadpair:{a}|{b}"
 
-# --- add near other env reads ---
-LFG_MESSAGE_TEXT = _clean(os.getenv("LFG_MESSAGE_TEXT", "Someone is looking for game!"))
-
-# --- add these helpers (or replace existing stubs) ---
-
-def _list_messages(channel_id: str, limit: int = 100, before: str | None = None):
-    """List messages in a channel (most recent first). Returns a list of message objects."""
-    qs = {"limit": str(min(max(limit, 1), 100))}
-    if before:
-        qs["before"] = before
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?{urllib.parse.urlencode(qs)}"
-    req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
-    try:
-        return _discord_json(req) or []
-    except urllib.error.HTTPError as e:
-        print(f"[lfg] list messages HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
-        return []
-
+# -------- LFG helpers --------
 def _lfg_key(channel_id: str) -> str:
     return f"lfgmsg:{channel_id}"
 
 def _ensure_lfg_message(channel_id: str, content: str = None):
-    """Ensure a single LFG banner exists. If missing, create and store its ID."""
     content = content or LFG_MESSAGE_TEXT
     msg_id = _u_get(_lfg_key(channel_id))
     if msg_id:
@@ -187,18 +199,11 @@ def _ensure_lfg_message(channel_id: str, content: str = None):
     return {"ok": False, "status": "error"}
 
 def _clear_lfg_message(channel_id: str, content: str = None):
-    """
-    Delete ALL instances of the LFG banner in the channel and clear the Redis pointer.
-    Scans up to 500 recent messages (5 pages x 100).
-    """
     content = content or LFG_MESSAGE_TEXT
-
-    # 1) Try to delete the tracked one first (fast path)
     tracked_id = _u_get(_lfg_key(channel_id))
     if tracked_id:
         _delete_message(channel_id, tracked_id)
 
-    # 2) Scan recent messages and delete any that match the banner text
     MAX_PAGES = 5
     before = None
     total_deleted = 0
@@ -210,29 +215,24 @@ def _clear_lfg_message(channel_id: str, content: str = None):
             if (m.get("content") or "") == content:
                 if _delete_message(channel_id, m.get("id", "")):
                     total_deleted += 1
-        # paginate
         before = msgs[-1]["id"] if msgs else None
         if not before:
             break
 
-    # 3) Clear the pointer (even if we didn’t find any; it’s just a hint)
     _u_del(_lfg_key(channel_id))
     print(f"[lfg] deleted all occurrences: {total_deleted}")
     return {"ok": True, "status": "deleted_all", "deleted": total_deleted}
 
-
-# ---- Request handler
+# -------- Request handler --------
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         _respond(self, 200, {"ok": True, "message": "webhook up"})
 
     def do_POST(self):
         try:
-            # Secret
             if SHARED_SECRET and self.headers.get("X-Shared-Secret", "") != SHARED_SECRET:
                 return _respond(self, 401, {"error": "unauthorized"})
 
-            # Parse
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             if self.headers.get("Content-Transfer-Encoding") == "base64":
@@ -244,23 +244,50 @@ class handler(BaseHTTPRequestHandler):
 
             service = (data.get("service") or "").strip().lower()
 
-            # --- Special case: queuestatus -> auto-lfg state message
+            # --- auto-LFG & queue analytics logging
             if service == "queuestatus":
                 v = data.get("isLooking")
                 is_looking = False
-                if isinstance(v, bool):
-                    is_looking = v
-                elif isinstance(v, (int, float)):
-                    is_looking = (int(v) != 0)
-                elif isinstance(v, str):
-                    is_looking = v.strip().lower() in ("true", "1", "yes", "y")
+                if isinstance(v, bool): is_looking = v
+                elif isinstance(v, (int, float)): is_looking = (int(v) != 0)
+                elif isinstance(v, str): is_looking = v.strip().lower() in ("true", "1", "yes", "y")
 
-                if not DISCORD_LFG_CHANNEL_ID:
-                    return _respond(self, 500, {"error": "DISCORD_LFG_CHANNEL_ID not set"})
-                res = _ensure_lfg_message(DISCORD_LFG_CHANNEL_ID) if is_looking else _clear_lfg_message(DISCORD_LFG_CHANNEL_ID)
-                return _respond(self, 200, {"ok": True, "lfg": res})
+                if is_looking:
+                    # LFG banner ensure
+                    if not DISCORD_LFG_CHANNEL_ID:
+                        return _respond(self, 500, {"error":"DISCORD_LFG_CHANNEL_ID not set"})
+                    banner = _ensure_lfg_message(DISCORD_LFG_CHANNEL_ID)
 
-            # --- Default: match flow (behave as before)
+                    # Queue analytics: start session if not active
+                    now = int(time.time())
+                    if _u_get(Q_ACTIVE_KEY) != "1":
+                        _u_set(Q_ACTIVE_KEY, "1")
+                        _u_set(Q_STARTED_AT, str(now))
+                        print(f"[queue] started at {now}")
+                    return _respond(self, 200, {"ok": True, "lfg": banner, "queue":"on"})
+                else:
+                    # LFG off: delete all banners
+                    if DISCORD_LFG_CHANNEL_ID:
+                        cleared = _clear_lfg_message(DISCORD_LFG_CHANNEL_ID)
+                    else:
+                        cleared = {"ok": True, "status": "no_channel"}
+
+                    # Queue analytics: close session if active and store duration
+                    now = int(time.time())
+                    if _u_get(Q_ACTIVE_KEY) == "1":
+                        try:
+                            start = int(_u_get(Q_STARTED_AT) or "0")
+                        except:
+                            start = 0
+                        if start > 0 and now >= start:
+                            duration = now - start
+                            blob = json.dumps({"start": start, "end": now, "dur": duration})
+                            _u_zadd(Q_ZSET, now, blob)
+                            print(f"[queue] ended at {now} (dur={duration}s)")
+                        _u_del(Q_ACTIVE_KEY); _u_del(Q_STARTED_AT)
+                    return _respond(self, 200, {"ok": True, "lfg": cleared, "queue":"off"})
+
+            # --- Default: match flow (as before)
             p1 = (data.get("playerOne") or "").strip()
             p2 = (data.get("playerTwo") or "").strip()
             if not p1 or not p2:
@@ -269,17 +296,14 @@ class handler(BaseHTTPRequestHandler):
             id1, id2 = _lookup_discord_id(p1), _lookup_discord_id(p2)
             print(f"[step] resolved IDs: {p1}={id1 or 'N/A'}, {p2}={id2 or 'N/A'}")
 
-            # Skip if neither is linked (unchanged behavior)
             if not (id1 or id2):
                 return _respond(self, 200, {"ok": True, "skipped": "no_linked_players"})
 
-            # Build message & thread name
             m1 = f"<@{id1}>" if id1 else p1
             m2 = f"<@{id2}>" if id2 else p2
             content = f"🎮 New game started! {m1} vs {m2}"
             thread_name = f"{p1} vs {p2}"
 
-            # Reuse existing private thread if stored
             pair_key = _pair_key(p1, p2)
             thread_id = _u_get(pair_key)
             if thread_id and _ensure_unarchived(thread_id):
@@ -288,7 +312,6 @@ class handler(BaseHTTPRequestHandler):
                 _post_message(thread_id, content)
                 return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
 
-            # Create new private thread
             if not DISCORD_CHANNEL_ID:
                 return _respond(self, 500, {"error": "DISCORD_CHANNEL_ID not set"})
             th = _create_private_thread(thread_name)
