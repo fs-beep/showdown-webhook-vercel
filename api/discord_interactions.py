@@ -1,7 +1,7 @@
 # api/discord_interactions.py
 # Discord Interactions handler: /link, /whois, /unlink
 from http.server import BaseHTTPRequestHandler
-import os, json, urllib.request, urllib.parse, sys
+import os, json, urllib.request, urllib.parse, sys, time
 from nacl.signing import VerifyKey
 
 def _clean(v: str) -> str:
@@ -165,5 +165,29 @@ class handler(BaseHTTPRequestHandler):
                     return respond_json(self, ephemeral("You can only unlink your own mapping (or be an admin)."))
                 delete_player_link(playername)
                 return respond_json(self, ephemeral(f"Unlinked **{playername}** ✅"))
+
+            elif cmd == "queuestats":
+                # Read last 48h directly from Upstash (same as queue_stats.py)
+                rows = _u_zrangebyscore("queue:durations", int(time.time()) - 48*3600, int(time.time()))
+                durs = []
+                by_hour = {h: [] for h in range(24)}
+                for s in rows:
+                    try:
+                        obj = json.loads(s); dur = int(obj.get("dur") or 0); end_ts = int(obj.get("end") or 0)
+                        if dur > 0 and end_ts > 0:
+                            durs.append(dur)
+                            by_hour[time.gmtime(end_ts).tm_hour].append(dur)
+                    except: pass
+                def _avg(lst): return round(sum(lst)/len(lst),2) if lst else 0.0
+                overall = _avg(durs); overall_min = round(overall/60.0,2)
+                # Pull current hour
+                curh = time.gmtime().tm_hour
+                curh_avg = _avg(by_hour[curh]); curh_min = round(curh_avg/60.0,2)
+                msg = (f"**Queue stats (last 48h, UTC)**\n"
+                       f"Sessions: {len(durs)}\n"
+                       f"Overall avg: {overall}s (~{overall_min}m)\n"
+                       f"This hour (UTC {curh:02d}): {curh_avg}s (~{curh_min}m)")
+                return respond_json(self, {"type": CH_MSG, "data": {"content": msg, "flags": EPHEMERAL}})
+
 
         return respond_json(self, ephemeral("Unsupported interaction"))
