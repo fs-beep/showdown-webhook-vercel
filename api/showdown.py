@@ -63,6 +63,39 @@ def _u_zrangebyscore(key: str, min_score: int, max_score: int):
     except:
         return []
 
+import time, datetime
+
+def _u_incrby(key: str, amount: int):
+    k = urllib.parse.quote(key, safe="")
+    a = str(int(amount))
+    try:
+        return json.loads(_u_req(f"/incrby/{k}/{a}")).get("result")
+    except:
+        return None
+
+def _today_utc():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+def _log_queue_session(start_ts: int, end_ts: int):
+    """Append raw session + bump daily counters."""
+    if not (start_ts and end_ts and end_ts >= start_ts):
+        return
+    dur = end_ts - start_ts
+    blob = json.dumps({"start": start_ts, "end": end_ts, "dur": dur})
+    _u_zadd("queue:durations", end_ts, blob)
+    day = _today_utc()
+    _u_incrby(f"queue:daily:{day}:count", 1)
+    _u_incrby(f"queue:daily:{day}:sum_dur", dur)
+
+def _log_match_event(p1: str, p2: str, linked1: bool, linked2: bool, ts: int | None = None):
+    """Append raw match event + bump daily counter."""
+    ts = ts or int(time.time())
+    blob = json.dumps({"ts": ts, "p1": p1, "p2": p2, "linked": [bool(linked1), bool(linked2)]})
+    _u_zadd("matches:events", ts, blob)
+    day = _today_utc()
+    _u_incrby(f"matches:daily:{day}:count", 1)
+
+
 # -------- Player → Discord ID --------
 def _lookup_discord_id(player_name: str):
     key = f"playerlink:{player_name.strip().lower()}"
