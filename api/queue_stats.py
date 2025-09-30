@@ -10,7 +10,7 @@ UPSTASH_TOKEN = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET = _clean(os.getenv("SHARED_SECRET", ""))
 
 Q_ZSET        = "queue:durations"
-WINDOW_SEC    = 48 * 3600  # last 48 hours
+WINDOW_SEC    = 168 * 3600  # last 7 days
 
 def _respond(h, status=200, obj=None):
     h.send_response(status); h.send_header("Content-Type","application/json")
@@ -57,7 +57,7 @@ class handler(BaseHTTPRequestHandler):
             return round(statistics.mean(lst), 2) if lst else 0.0
 
         stats = {
-            "window_hours": 48,
+            "window_hours": 168,
             "count": len(durations),
             "avg_sec": _avg(durations),
             "avg_min": round((_avg(durations) / 60.0), 2),
