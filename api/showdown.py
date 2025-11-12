@@ -2,7 +2,7 @@
 # (unchanged header comment omitted for brevity)
 
 from http.server import BaseHTTPRequestHandler
-import json, os, base64, urllib.request, urllib.parse, sys, traceback, time, math
+import json, os, base64, urllib.request, urllib.parse, urllib.error, sys, traceback, time, math
 
 def _clean(v: str) -> str:
     return (v or "").strip().strip('"').strip("'")
@@ -11,6 +11,7 @@ def _clean(v: str) -> str:
 DISCORD_BOT_TOKEN      = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
 DISCORD_CHANNEL_ID     = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
 DISCORD_LFG_CHANNEL_ID = _clean(os.getenv("DISCORD_LFG_CHANNEL_ID", ""))
+DISCORD_WEBHOOK        = _clean(os.getenv("DISCORD_WEBHOOK", ""))
 UPSTASH_URL            = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
 UPSTASH_TOKEN          = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 SHARED_SECRET          = _clean(os.getenv("SHARED_SECRET", ""))
@@ -135,6 +136,27 @@ def _post_message(channel_id: str, content: str):
         return obj
     except urllib.error.HTTPError as e:
         print(f"[discord] post HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        return None
+
+def _post_webhook(content: str):
+    if not DISCORD_WEBHOOK:
+        return None
+    try:
+        # If env contains full webhook URL, use as-is
+        url = DISCORD_WEBHOOK
+        body = {"content": content, "allowed_mentions": {"parse": ["users"]}}
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            txt = r.read().decode() or "{}"
+            try:
+                obj = json.loads(txt)
+            except:
+                obj = {"raw": txt}
+            print(f"[discord-webhook] posted: status={r.status}")
+            return obj
+    except urllib.error.HTTPError as e:
+        print(f"[discord-webhook] HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
         return None
 
 def _delete_message(channel_id: str, message_id: str):
@@ -263,7 +285,13 @@ class handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if SHARED_SECRET and self.headers.get("X-Shared-Secret", "") != SHARED_SECRET:
+            # Basic ingress diagnostics
+            recv_secret = self.headers.get("X-Shared-Secret", "")
+            if SHARED_SECRET and recv_secret != SHARED_SECRET:
+                try:
+                    print(f"[ingress] unauthorized /api/showdown from {self.client_address[0]} secret_len={len(recv_secret)}", file=sys.stderr)
+                except Exception:
+                    pass
                 return _respond(self, 401, {"error": "unauthorized"})
 
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -276,6 +304,10 @@ class handler(BaseHTTPRequestHandler):
                 return _respond(self, 400, {"error": "invalid json"})
 
             service = (data.get("service") or "").strip().lower()
+            try:
+                print(f"[ingress] showdown len={length} ct={self.headers.get('Content-Type','')} service='{service}' keys={list(data.keys())}")
+            except Exception:
+                pass
 
             # --- auto-LFG & queue analytics logging
             if service == "queuestatus":
@@ -345,10 +377,19 @@ class handler(BaseHTTPRequestHandler):
                 _post_message(thread_id, content)
                 return _respond(self, 200, {"ok": True, "posted_in": "existing_thread", "thread_id": thread_id})
 
+            # If bot channel/thread creation is unavailable, fallback to a simple webhook post
             if not DISCORD_CHANNEL_ID:
+                if DISCORD_WEBHOOK:
+                    _post_webhook(content)
+                    return _respond(self, 200, {"ok": True, "posted_in": "webhook"})
                 return _respond(self, 500, {"error": "DISCORD_CHANNEL_ID not set"})
+
             th = _create_private_thread(thread_name)
             if not th or not th.get("id"):
+                # Fallback: try webhook if available
+                if DISCORD_WEBHOOK:
+                    _post_webhook(content)
+                    return _respond(self, 200, {"ok": True, "posted_in": "webhook"})
                 return _respond(self, 500, {"error": "failed to create thread"})
             thread_id = th["id"]
             _u_set(pair_key, thread_id)
