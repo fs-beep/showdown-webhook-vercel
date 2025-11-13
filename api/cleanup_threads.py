@@ -44,10 +44,16 @@ def _parse_days_from_query(path: str) -> int:
 
 
 def _verify_secret(headers) -> bool:
+    # Allow Vercel Cron invocations (they include this header)
+    if headers.get("x-vercel-cron"):
+        return True
+
     if not SHARED_SECRET:
         return True
+
     provided = headers.get("X-Shared-Secret") or headers.get("x-shared-secret")
     return provided is not None and provided == SHARED_SECRET
+
 
 
 def _discord_headers():
