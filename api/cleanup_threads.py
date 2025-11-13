@@ -11,6 +11,9 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 SHARED_SECRET = os.environ.get("SHARED_SECRET")
 
+# Discord channel type for private threads
+GUILD_PRIVATE_THREAD = 12
+
 
 def _json_response(handler, status: int, payload: dict):
     body = json.dumps(payload).encode("utf-8")
@@ -76,29 +79,39 @@ def _discord_request(method: str, path: str, params: dict | None = None):
     return status, data
 
 
-def _fetch_archived_threads():
+def _fetch_private_threads():
     """
-    Fetch up to 100 archived public + 100 archived private threads.
+    Fetch ALL private threads in the channel:
+    - active threads (via /threads/active)
+    - archived private threads (via /threads/archived/private)
+    Then filter to type == GUILD_PRIVATE_THREAD.
     """
-    all_threads = []
+    all_threads: list[dict] = []
 
-    for kind in ("public", "private"):
-        path = f"/channels/{DISCORD_CHANNEL_ID}/threads/archived/{kind}"
-        status, data = _discord_request("GET", path, params={"limit": 100})
+    # 1) Active threads
+    path_active = f"/channels/{DISCORD_CHANNEL_ID}/threads/active"
+    status_a, data_a = _discord_request("GET", path_active, params=None)
+    if status_a != 200:
+        raise RuntimeError(f"Discord API error (active) {status_a}: {data_a[:300]}")
 
-        if status != 200:
-            # don't nuke everything if one type fails – just report it
-            raise RuntimeError(f"Discord API error ({kind}) {status}: {data[:300]}")
+    obj_a = json.loads(data_a)
+    threads_a = obj_a.get("threads", []) if isinstance(obj_a, dict) else obj_a
+    all_threads.extend(threads_a)
 
-        obj = json.loads(data)
-        if isinstance(obj, dict):
-            threads = obj.get("threads", [])
-        else:
-            threads = obj
+    # 2) Archived private threads
+    path_arch = f"/channels/{DISCORD_CHANNEL_ID}/threads/archived/private"
+    status_p, data_p = _discord_request("GET", path_arch, params={"limit": 100})
+    if status_p != 200:
+        raise RuntimeError(f"Discord API error (archived/private) {status_p}: {data_p[:300]}")
 
-        all_threads.extend(threads)
+    obj_p = json.loads(data_p)
+    threads_p = obj_p.get("threads", []) if isinstance(obj_p, dict) else obj_p
+    all_threads.extend(threads_p)
 
-    return all_threads
+    # Filter only private-thread type (12)
+    private_threads = [t for t in all_threads if t.get("type") == GUILD_PRIVATE_THREAD]
+
+    return private_threads
 
 
 def _delete_thread(thread_id: str):
@@ -113,19 +126,29 @@ def _delete_thread(thread_id: str):
 
 def _cleanup(days: int):
     cutoff = _get_cutoff(days)
-    threads = _fetch_archived_threads()
+    threads = _fetch_private_threads()
 
     deleted = 0
-    checked = 0
     errors: list[str] = []
+    debug_list: list[dict] = []
 
     for t in threads:
-        checked += 1
         meta = t.get("thread_metadata") or {}
         archive_ts = meta.get("archive_timestamp")
 
+        # Collect debug info (first 20 only)
+        if len(debug_list) < 20:
+            debug_list.append(
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name"),
+                    "archive_timestamp": archive_ts,
+                    "archived": meta.get("archived"),
+                }
+            )
+
         if not archive_ts:
-            # No archive timestamp → skip
+            # if somehow missing, skip age check
             continue
 
         ts_str = archive_ts.replace("Z", "+00:00")
@@ -146,9 +169,10 @@ def _cleanup(days: int):
         "channel_id": DISCORD_CHANNEL_ID,
         "cutoff_iso": cutoff.isoformat(),
         "days": days,
-        "checked": checked,
+        "total_private_threads": len(threads),
         "deleted": deleted,
         "errors": errors,
+        "debug_sample": debug_list,
     }
 
 
