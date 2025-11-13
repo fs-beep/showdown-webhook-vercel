@@ -9,10 +9,10 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 SHARED_SECRET = os.environ.get("SHARED_SECRET")
 
-# Discord channel type for private threads
-GUILD_PRIVATE_THREAD = 12
+GUILD_PRIVATE_THREAD = 12  # Discord type for private threads
 
 
 def _json_response(handler, status: int, payload: dict):
@@ -61,9 +61,6 @@ def _discord_headers():
 
 
 def _discord_request(method: str, path: str, params: dict | None = None):
-    if not DISCORD_CHANNEL_ID:
-        raise RuntimeError("DISCORD_CHANNEL_ID is not set")
-
     url = DISCORD_API_BASE + path
     if params:
         url += "?" + urlencode(params)
@@ -81,24 +78,28 @@ def _discord_request(method: str, path: str, params: dict | None = None):
 
 def _fetch_private_threads():
     """
-    Fetch ALL private threads in the channel:
-    - active threads (via /threads/active)
-    - archived private threads (via /threads/archived/private)
-    Then filter to type == GUILD_PRIVATE_THREAD.
+    Get ALL private threads whose parent is DISCORD_CHANNEL_ID:
+    - active threads from /guilds/{guild_id}/threads/active
+    - archived private threads from /channels/{channel_id}/threads/archived/private
     """
+    if not DISCORD_GUILD_ID:
+        raise RuntimeError("DISCORD_GUILD_ID is not set")
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("DISCORD_CHANNEL_ID is not set")
+
     all_threads: list[dict] = []
 
-    # 1) Active threads
-    path_active = f"/channels/{DISCORD_CHANNEL_ID}/threads/active"
-    status_a, data_a = _discord_request("GET", path_active, params=None)
+    # 1) Guild-wide active threads
+    path_active = f"/guilds/{DISCORD_GUILD_ID}/threads/active"
+    status_a, data_a = _discord_request("GET", path_active)
     if status_a != 200:
-        raise RuntimeError(f"Discord API error (active) {status_a}: {data_a[:300]}")
+        raise RuntimeError(f"Discord API error (guild active) {status_a}: {data_a[:300]}")
 
     obj_a = json.loads(data_a)
     threads_a = obj_a.get("threads", []) if isinstance(obj_a, dict) else obj_a
     all_threads.extend(threads_a)
 
-    # 2) Archived private threads
+    # 2) Archived private threads for this channel
     path_arch = f"/channels/{DISCORD_CHANNEL_ID}/threads/archived/private"
     status_p, data_p = _discord_request("GET", path_arch, params={"limit": 100})
     if status_p != 200:
@@ -108,8 +109,12 @@ def _fetch_private_threads():
     threads_p = obj_p.get("threads", []) if isinstance(obj_p, dict) else obj_p
     all_threads.extend(threads_p)
 
-    # Filter only private-thread type (12)
-    private_threads = [t for t in all_threads if t.get("type") == GUILD_PRIVATE_THREAD]
+    # Filter: private threads in our channel
+    private_threads = [
+        t for t in all_threads
+        if t.get("type") == GUILD_PRIVATE_THREAD
+        and str(t.get("parent_id")) == str(DISCORD_CHANNEL_ID)
+    ]
 
     return private_threads
 
@@ -136,7 +141,6 @@ def _cleanup(days: int):
         meta = t.get("thread_metadata") or {}
         archive_ts = meta.get("archive_timestamp")
 
-        # Collect debug info (first 20 only)
         if len(debug_list) < 20:
             debug_list.append(
                 {
@@ -148,7 +152,6 @@ def _cleanup(days: int):
             )
 
         if not archive_ts:
-            # if somehow missing, skip age check
             continue
 
         ts_str = archive_ts.replace("Z", "+00:00")
@@ -167,6 +170,7 @@ def _cleanup(days: int):
 
     return {
         "channel_id": DISCORD_CHANNEL_ID,
+        "guild_id": DISCORD_GUILD_ID,
         "cutoff_iso": cutoff.isoformat(),
         "days": days,
         "total_private_threads": len(threads),
