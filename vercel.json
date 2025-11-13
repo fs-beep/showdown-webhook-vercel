@@ -2,6 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["fra1"],
   "crons": [
-    { "path": "/api/cleanup_threads", "schedule": "0 */6 * * *" }
+    { "path": "/api/cleanup_threads", "schedule": "0 4 * * *" }
   ]
 }
