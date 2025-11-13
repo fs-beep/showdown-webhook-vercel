@@ -1,16 +1,15 @@
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.request import Request, urlopen
 from datetime import datetime, timedelta, timezone
 import json
 import os
-import requests
-
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
-SHARED_SECRET = os.environ.get("SHARED_SECRET")  # same as /api/showdown etc.
+SHARED_SECRET = os.environ.get("SHARED_SECRET")  # same as other endpoints
 
 
 def _json_response(handler, status: int, payload: dict):
@@ -24,10 +23,6 @@ def _json_response(handler, status: int, payload: dict):
 
 def _unauthorized(handler, reason: str):
     _json_response(handler, 401, {"error": "unauthorized", "reason": reason})
-
-
-def _bad_request(handler, reason: str):
-    _json_response(handler, 400, {"error": "bad_request", "reason": reason})
 
 
 def _get_cutoff(days: int) -> datetime:
@@ -46,65 +41,79 @@ def _parse_days_from_query(path: str) -> int:
 
 
 def _verify_secret(headers) -> bool:
-    if SHARED_SECRET is None:
-        # If you *want* to enforce having a secret set, flip this.
+    # If SHARED_SECRET is not set, skip verification (you can force it if you want)
+    if not SHARED_SECRET:
         return True
     provided = headers.get("X-Shared-Secret") or headers.get("x-shared-secret")
     return provided is not None and provided == SHARED_SECRET
 
 
 def _discord_headers():
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
         "User-Agent": "ShowdownCleanupBot (cleanup_threads.py)",
+        "Content-Type": "application/json",
     }
+
+
+def _discord_request(method: str, path: str, params: dict | None = None):
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("DISCORD_CHANNEL_ID is not set")
+
+    url = DISCORD_API_BASE + path
+    if params:
+        url += "?" + urlencode(params)
+
+    req = Request(url, method=method, headers=_discord_headers())
+    try:
+        with urlopen(req, timeout=10) as resp:
+            status = resp.getcode()
+            data = resp.read().decode("utf-8")
+    except Exception as e:
+        # Bubble up with some context
+        raise RuntimeError(f"HTTP error calling {url}: {e}") from e
+
+    return status, data
 
 
 def _fetch_archived_private_threads():
     """
     Fetch up to 100 archived private threads for the configured channel.
-
-    If you somehow accumulate >100, you can extend this with pagination.
+    Discord response shape: { "threads": [...], "members": [...], "has_more": bool }
     """
-    url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/threads/archived/private"
-    resp = requests.get(url, headers=_discord_headers(), params={"limit": 100}, timeout=10)
+    path = f"/channels/{DISCORD_CHANNEL_ID}/threads/archived/private"
+    status, data = _discord_request("GET", path, params={"limit": 100})
 
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Discord API error {resp.status_code}: {resp.text[:300]}"
-        )
+    if status != 200:
+        raise RuntimeError(f"Discord API error {status}: {data[:300]}")
 
-    data = resp.json()
-    # Some libs wrap in {"threads": [...]} – handle both styles.
-    if isinstance(data, dict):
-        threads = data.get("threads", [])
-    else:
-        threads = data
-    return threads
+    obj = json.loads(data)
+    if isinstance(obj, dict):
+        return obj.get("threads", [])
+    return obj
 
 
 def _delete_thread(thread_id: str):
-    url = f"{DISCORD_API_BASE}/channels/{thread_id}"
-    resp = requests.delete(url, headers=_discord_headers(), timeout=10)
-    # 204 = deleted, 404 = already gone, treat both as success
-    if resp.status_code not in (204, 404):
+    # Deleting a thread uses the channel delete endpoint with the thread id
+    path = f"/channels/{thread_id}"
+    status, data = _discord_request("DELETE", path)
+
+    # 204 = deleted, 404 = already gone → treat both as success
+    if status not in (204, 404):
         raise RuntimeError(
-            f"Failed to delete thread {thread_id}: {resp.status_code} {resp.text[:300]}"
+            f"Failed to delete thread {thread_id}: {status} {data[:300]}"
         )
 
 
 def _cleanup(days: int):
-    if not DISCORD_BOT_TOKEN:
-        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
-    if not DISCORD_CHANNEL_ID:
-        raise RuntimeError("DISCORD_CHANNEL_ID is not set")
-
     cutoff = _get_cutoff(days)
     threads = _fetch_archived_private_threads()
 
     deleted = 0
     checked = 0
-    errors = []
+    errors: list[str] = []
 
     for t in threads:
         checked += 1
@@ -112,10 +121,10 @@ def _cleanup(days: int):
         archive_ts = meta.get("archive_timestamp")
 
         if not archive_ts:
-            # fallback: use timestamp on 'last_message_id' or ignore
+            # no timestamp → skip
             continue
 
-        # Discord timestamps are ISO8601, often with Z suffix
+        # Example: "2024-11-12T15:30:00.000000+00:00" or "...Z"
         ts_str = archive_ts.replace("Z", "+00:00")
         try:
             ts = datetime.fromisoformat(ts_str)
@@ -145,8 +154,8 @@ class handler(BaseHTTPRequestHandler):
     Vercel Python function entrypoint.
     Supports GET and POST:
 
-    - Requires correct X-Shared-Secret (if SHARED_SECRET is set).
-    - Optional query param ?days=N (default 1).
+    - requires correct X-Shared-Secret (if SHARED_SECRET is set)
+    - optional query ?days=N (default 1)
     """
 
     def do_GET(self):
@@ -156,6 +165,7 @@ class handler(BaseHTTPRequestHandler):
         self._handle()
 
     def _handle(self):
+        # Auth first
         if not _verify_secret(self.headers):
             return _unauthorized(self, "missing_or_invalid_shared_secret")
 
@@ -164,6 +174,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             result = _cleanup(days)
         except Exception as e:
+            # If anything explodes, return JSON instead of killing the function
             return _json_response(
                 self,
                 500,
