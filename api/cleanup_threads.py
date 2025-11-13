@@ -51,16 +51,17 @@ def _list_active_threads(channel_id: str):
         print(f"[cleanup] active HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
         return []
 
-def _list_private_archived_before(channel_id: str, before_ts_seconds: int):
-    # before must be ISO8601 timestamp
-    before_iso = _iso(before_ts_seconds)
-    url = f"https://discord.com/api/v10/channels/{channel_id}/threads/archived/private?before={urllib.parse.quote(before_iso, safe='')}"
+def _list_private_archived(channel_id: str, before_id: str | None = None):
+    # For PRIVATE archived threads, 'before' must be a snowflake (thread ID), not a timestamp
+    url = f"https://discord.com/api/v10/channels/{channel_id}/threads/archived/private"
+    if before_id:
+        url += f"?before={urllib.parse.quote(before_id, safe='')}"
     req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
     try:
         obj = _discord_json(req) or {}
         return obj.get("threads") or [], bool(obj.get("has_more"))
     except urllib.error.HTTPError as e:
-        print(f"[cleanup] private-archived HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
+        print(f"[cleanup] private-archived HTTPError {e.code} {e.read().decode(errors='replace')} url={url}", file=sys.stderr)
         return [], False
 
 def _delete_thread(thread_id: str) -> bool:
@@ -93,10 +94,12 @@ def _cleanup(channel_id: str, max_age_seconds: int):
             if _delete_thread(tid): deleted += 1
             else: errors += 1
 
-    # Private archived threads older than cutoff
-    # We query with 'before=cutoff_iso' to only fetch older ones
-    threads, has_more = _list_private_archived_before(channel_id, cutoff_seconds)
+    # Private archived threads: paginate using 'before' = last thread ID
+    before_id = None
     while True:
+        threads, has_more = _list_private_archived(channel_id, before_id)
+        if not threads:
+            break
         for th in threads:
             inspected += 1
             tid = th.get("id", "")
@@ -106,9 +109,7 @@ def _cleanup(channel_id: str, max_age_seconds: int):
                 else: errors += 1
         if not has_more:
             break
-        # For safety, paginate further back in time by moving the cutoff further back 1 day
-        cutoff_seconds -= 24 * 3600
-        threads, has_more = _list_private_archived_before(channel_id, cutoff_seconds)
+        before_id = threads[-1].get("id")
 
     return {"ok": True, "inspected": inspected, "deleted": deleted, "errors": errors, "cutoff_seconds": cutoff_seconds}
 
