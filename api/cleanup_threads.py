@@ -7,6 +7,8 @@ def _clean(v: str) -> str:
 DISCORD_BOT_TOKEN  = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
 DISCORD_CHANNEL_ID = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
 SHARED_SECRET      = _clean(os.getenv("SHARED_SECRET", ""))
+UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
+UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
 
 # Default: 2 days
 THREAD_MAX_AGE_SECONDS = int(_clean(os.getenv("THREAD_MAX_AGE_SECONDS", str(2 * 24 * 3600))) or "172800")
@@ -76,6 +78,41 @@ def _delete_thread(thread_id: str) -> bool:
         # Consider 404 as already gone
         return e.code in (404, 403)  # 403 could happen if already removed or perms; treat as non-fatal
 
+# ---------- Upstash helpers (fallback enumeration) ----------
+def _u_req(path: str):
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        raise RuntimeError("Upstash not configured")
+    req = urllib.request.Request(f"{UPSTASH_URL}{path}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return r.read().decode("utf-8")
+
+def _u_scan(match: str, count: int = 200):
+    cursor = 0
+    keys = []
+    tries = 0
+    # Upstash REST: /scan/{cursor}?match=pattern&count=N
+    while True:
+        tries += 1
+        try:
+            body = _u_req(f"/scan/{cursor}?match={urllib.parse.quote(match, safe='')}&count={int(count)}")
+            obj = json.loads(body)
+        except Exception as e:
+            print(f"[cleanup] scan error: {e}", file=sys.stderr)
+            break
+        cursor = int(obj.get("cursor") or 0)
+        keys.extend(obj.get("keys") or obj.get("results") or [])
+        if cursor == 0 or tries > 100:
+            break
+    return keys
+
+def _u_get(key: str):
+    try:
+        k = urllib.parse.quote(key, safe="")
+        body = _u_req(f"/get/{k}")
+        return json.loads(body).get("result")
+    except:
+        return None
+
 def _cleanup(channel_id: str, max_age_seconds: int):
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - (max_age_seconds * 1000)
@@ -110,6 +147,23 @@ def _cleanup(channel_id: str, max_age_seconds: int):
         if not has_more:
             break
         before_id = threads[-1].get("id")
+
+    # Fallback: enumerate known thread IDs from Upstash (pair mappings)
+    # Keys: threadpair:<nameA>|<nameB> -> <thread_id>
+    seen = set()
+    try:
+        for key in _u_scan("threadpair:*", count=200):
+            tid = _u_get(key)
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            inspected += 1
+            created_ms = _snowflake_ms(str(tid))
+            if created_ms and created_ms < cutoff_ms:
+                if _delete_thread(str(tid)): deleted += 1
+                else: errors += 1
+    except Exception as e:
+        print(f"[cleanup] upstash fallback error: {e}", file=sys.stderr)
 
     return {"ok": True, "inspected": inspected, "deleted": deleted, "errors": errors, "cutoff_seconds": cutoff_seconds}
 
