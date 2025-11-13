@@ -1,189 +1,176 @@
 from http.server import BaseHTTPRequestHandler
-import json, os, sys, time, urllib.request, urllib.parse, urllib.error, datetime
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta, timezone
+import json
+import os
+import requests
 
-def _clean(v: str) -> str:
-    return (v or "").strip().strip('"').strip("'")
 
-DISCORD_BOT_TOKEN  = _clean(os.getenv("DISCORD_BOT_TOKEN", ""))
-DISCORD_CHANNEL_ID = _clean(os.getenv("DISCORD_CHANNEL_ID", ""))
-SHARED_SECRET      = _clean(os.getenv("SHARED_SECRET", ""))
-UPSTASH_URL        = _clean(os.getenv("UPSTASH_REDIS_REST_URL", ""))
-UPSTASH_TOKEN      = _clean(os.getenv("UPSTASH_REDIS_REST_TOKEN", ""))
+DISCORD_API_BASE = "https://discord.com/api/v10"
 
-# Default: 2 days
-THREAD_MAX_AGE_SECONDS = int(_clean(os.getenv("THREAD_MAX_AGE_SECONDS", str(2 * 24 * 3600))) or "172800")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
+SHARED_SECRET = os.environ.get("SHARED_SECRET")  # same as /api/showdown etc.
 
-DISCORD_EPOCH_MS = 1420070400000
 
-def _bot_headers():
+def _json_response(handler, status: int, payload: dict):
+    body = json.dumps(payload).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _unauthorized(handler, reason: str):
+    _json_response(handler, 401, {"error": "unauthorized", "reason": reason})
+
+
+def _bad_request(handler, reason: str):
+    _json_response(handler, 400, {"error": "bad_request", "reason": reason})
+
+
+def _get_cutoff(days: int) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _parse_days_from_query(path: str) -> int:
+    parsed = urlparse(path)
+    qs = parse_qs(parsed.query)
+    try:
+        if "days" in qs:
+            return max(1, int(qs["days"][0]))
+    except (ValueError, TypeError):
+        pass
+    return 1  # default
+
+
+def _verify_secret(headers) -> bool:
+    if SHARED_SECRET is None:
+        # If you *want* to enforce having a secret set, flip this.
+        return True
+    provided = headers.get("X-Shared-Secret") or headers.get("x-shared-secret")
+    return provided is not None and provided == SHARED_SECRET
+
+
+def _discord_headers():
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, */*",
-        "User-Agent": "MatchNotifier-Cleanup (https://github.com/your-repo, 1.0)",
-        "Connection": "close",
+        "User-Agent": "ShowdownCleanupBot (cleanup_threads.py)",
     }
 
-def _discord_json(req, timeout=12):
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        txt = r.read().decode() or "{}"
-        try: return json.loads(txt)
-        except: return {}
 
-def _respond(h, status=200, obj=None):
-    h.send_response(status); h.send_header("Content-Type", "application/json")
-    h.end_headers(); h.wfile.write(json.dumps(obj if obj is not None else {"ok": True}).encode("utf-8"))
+def _fetch_archived_private_threads():
+    """
+    Fetch up to 100 archived private threads for the configured channel.
 
-def _snowflake_ms(snowflake: str) -> int:
-    try:
-        return (int(snowflake) >> 22) + DISCORD_EPOCH_MS
-    except:
-        return 0
+    If you somehow accumulate >100, you can extend this with pagination.
+    """
+    url = f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/threads/archived/private"
+    resp = requests.get(url, headers=_discord_headers(), params={"limit": 100}, timeout=10)
 
-def _iso(ts_seconds: int) -> str:
-    return datetime.datetime.utcfromtimestamp(ts_seconds).replace(microsecond=0).isoformat() + "Z"
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Discord API error {resp.status_code}: {resp.text[:300]}"
+        )
 
-def _list_active_threads(channel_id: str):
-    url = f"https://discord.com/api/v10/channels/{channel_id}/threads/active"
-    req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
-    try:
-        obj = _discord_json(req) or {}
-        return obj.get("threads") or []
-    except urllib.error.HTTPError as e:
-        print(f"[cleanup] active HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
-        return []
+    data = resp.json()
+    # Some libs wrap in {"threads": [...]} – handle both styles.
+    if isinstance(data, dict):
+        threads = data.get("threads", [])
+    else:
+        threads = data
+    return threads
 
-def _list_private_archived(channel_id: str, before_id: str | None = None):
-    # For PRIVATE archived threads, 'before' must be a snowflake (thread ID), not a timestamp
-    url = f"https://discord.com/api/v10/channels/{channel_id}/threads/archived/private"
-    if before_id:
-        url += f"?before={urllib.parse.quote(before_id, safe='')}"
-    req = urllib.request.Request(url, headers=_bot_headers(), method="GET")
-    try:
-        obj = _discord_json(req) or {}
-        return obj.get("threads") or [], bool(obj.get("has_more"))
-    except urllib.error.HTTPError as e:
-        print(f"[cleanup] private-archived HTTPError {e.code} {e.read().decode(errors='replace')} url={url}", file=sys.stderr)
-        return [], False
 
-def _delete_thread(thread_id: str) -> bool:
-    url = f"https://discord.com/api/v10/channels/{thread_id}"
-    req = urllib.request.Request(url, headers=_bot_headers(), method="DELETE")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            print(f"[cleanup] delete thread {thread_id} -> {r.status}")
-            return True
-    except urllib.error.HTTPError as e:
-        print(f"[cleanup] delete HTTPError {e.code} {e.read().decode(errors='replace')}", file=sys.stderr)
-        # Consider 404 as already gone
-        return e.code in (404, 403)  # 403 could happen if already removed or perms; treat as non-fatal
+def _delete_thread(thread_id: str):
+    url = f"{DISCORD_API_BASE}/channels/{thread_id}"
+    resp = requests.delete(url, headers=_discord_headers(), timeout=10)
+    # 204 = deleted, 404 = already gone, treat both as success
+    if resp.status_code not in (204, 404):
+        raise RuntimeError(
+            f"Failed to delete thread {thread_id}: {resp.status_code} {resp.text[:300]}"
+        )
 
-# ---------- Upstash helpers (fallback enumeration) ----------
-def _u_req(path: str):
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        raise RuntimeError("Upstash not configured")
-    req = urllib.request.Request(f"{UPSTASH_URL}{path}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        return r.read().decode("utf-8")
 
-def _u_scan(match: str, count: int = 200):
-    cursor = 0
-    keys = []
-    tries = 0
-    # Upstash REST: /scan/{cursor}?match=pattern&count=N
-    while True:
-        tries += 1
-        try:
-            body = _u_req(f"/scan/{cursor}?match={urllib.parse.quote(match, safe='')}&count={int(count)}")
-            obj = json.loads(body)
-        except Exception as e:
-            print(f"[cleanup] scan error: {e}", file=sys.stderr)
-            break
-        cursor = int(obj.get("cursor") or 0)
-        keys.extend(obj.get("keys") or obj.get("results") or [])
-        if cursor == 0 or tries > 100:
-            break
-    return keys
+def _cleanup(days: int):
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("DISCORD_CHANNEL_ID is not set")
 
-def _u_get(key: str):
-    try:
-        k = urllib.parse.quote(key, safe="")
-        body = _u_req(f"/get/{k}")
-        return json.loads(body).get("result")
-    except:
-        return None
+    cutoff = _get_cutoff(days)
+    threads = _fetch_archived_private_threads()
 
-def _cleanup(channel_id: str, max_age_seconds: int):
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - (max_age_seconds * 1000)
-    cutoff_seconds = int(cutoff_ms / 1000)
-
-    inspected = 0
     deleted = 0
-    errors = 0
-    debug = {"active_seen": 0, "private_archived_pages": 0, "upstash_keys": 0}
+    checked = 0
+    errors = []
 
-    # Active threads
-    active_threads = _list_active_threads(channel_id)
-    debug["active_seen"] = len(active_threads)
-    for th in active_threads:
-        inspected += 1
-        tid = th.get("id", "")
-        created_ms = _snowflake_ms(tid)
-        if created_ms and created_ms < cutoff_ms:
-            if _delete_thread(tid): deleted += 1
-            else: errors += 1
+    for t in threads:
+        checked += 1
+        meta = t.get("thread_metadata") or {}
+        archive_ts = meta.get("archive_timestamp")
 
-    # Private archived threads: paginate using 'before' = last thread ID
-    before_id = None
-    while True:
-        threads, has_more = _list_private_archived(channel_id, before_id)
-        if not threads:
-            break
-        debug["private_archived_pages"] += 1
-        for th in threads:
-            inspected += 1
-            tid = th.get("id", "")
-            created_ms = _snowflake_ms(tid)
-            if created_ms and created_ms < cutoff_ms:
-                if _delete_thread(tid): deleted += 1
-                else: errors += 1
-        if not has_more:
-            break
-        before_id = threads[-1].get("id")
+        if not archive_ts:
+            # fallback: use timestamp on 'last_message_id' or ignore
+            continue
 
-    # Fallback: enumerate known thread IDs from Upstash (pair mappings)
-    # Keys: threadpair:<nameA>|<nameB> -> <thread_id>
-    seen = set()
-    try:
-        keys = _u_scan("threadpair:*", count=200)
-        debug["upstash_keys"] = len(keys)
-        for key in keys:
-            tid = _u_get(key)
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            inspected += 1
-            created_ms = _snowflake_ms(str(tid))
-            if created_ms and created_ms < cutoff_ms:
-                if _delete_thread(str(tid)): deleted += 1
-                else: errors += 1
-    except Exception as e:
-        print(f"[cleanup] upstash fallback error: {e}", file=sys.stderr)
+        # Discord timestamps are ISO8601, often with Z suffix
+        ts_str = archive_ts.replace("Z", "+00:00")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            errors.append(f"Could not parse timestamp: {archive_ts}")
+            continue
 
-    return {"ok": True, "inspected": inspected, "deleted": deleted, "errors": errors, "cutoff_seconds": cutoff_seconds, "debug": debug}
+        if ts < cutoff:
+            try:
+                _delete_thread(t["id"])
+                deleted += 1
+            except Exception as e:
+                errors.append(f"delete {t.get('id')}: {e}")
+
+    return {
+        "channel_id": DISCORD_CHANNEL_ID,
+        "cutoff_iso": cutoff.isoformat(),
+        "days": days,
+        "checked": checked,
+        "deleted": deleted,
+        "errors": errors,
+    }
+
 
 class handler(BaseHTTPRequestHandler):
+    """
+    Vercel Python function entrypoint.
+    Supports GET and POST:
+
+    - Requires correct X-Shared-Secret (if SHARED_SECRET is set).
+    - Optional query param ?days=N (default 1).
+    """
+
     def do_GET(self):
-        if SHARED_SECRET and self.headers.get("X-Shared-Secret","") != SHARED_SECRET:
-            return _respond(self, 401, {"error": "unauthorized"})
-        if not (DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID):
-            return _respond(self, 500, {"error":"missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID"})
-        res = _cleanup(DISCORD_CHANNEL_ID, THREAD_MAX_AGE_SECONDS)
-        return _respond(self, 200, res)
+        self._handle()
 
     def do_POST(self):
-        # Same as GET to support Vercel cron or manual trigger
-        return self.do_GET()
+        self._handle()
 
+    def _handle(self):
+        if not _verify_secret(self.headers):
+            return _unauthorized(self, "missing_or_invalid_shared_secret")
 
+        days = _parse_days_from_query(self.path)
+
+        try:
+            result = _cleanup(days)
+        except Exception as e:
+            return _json_response(
+                self,
+                500,
+                {
+                    "error": "internal_error",
+                    "detail": str(e),
+                },
+            )
+
+        return _json_response(self, 200, result)
