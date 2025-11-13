@@ -121,9 +121,12 @@ def _cleanup(channel_id: str, max_age_seconds: int):
     inspected = 0
     deleted = 0
     errors = 0
+    debug = {"active_seen": 0, "private_archived_pages": 0, "upstash_keys": 0}
 
     # Active threads
-    for th in _list_active_threads(channel_id):
+    active_threads = _list_active_threads(channel_id)
+    debug["active_seen"] = len(active_threads)
+    for th in active_threads:
         inspected += 1
         tid = th.get("id", "")
         created_ms = _snowflake_ms(tid)
@@ -137,6 +140,7 @@ def _cleanup(channel_id: str, max_age_seconds: int):
         threads, has_more = _list_private_archived(channel_id, before_id)
         if not threads:
             break
+        debug["private_archived_pages"] += 1
         for th in threads:
             inspected += 1
             tid = th.get("id", "")
@@ -152,7 +156,9 @@ def _cleanup(channel_id: str, max_age_seconds: int):
     # Keys: threadpair:<nameA>|<nameB> -> <thread_id>
     seen = set()
     try:
-        for key in _u_scan("threadpair:*", count=200):
+        keys = _u_scan("threadpair:*", count=200)
+        debug["upstash_keys"] = len(keys)
+        for key in keys:
             tid = _u_get(key)
             if not tid or tid in seen:
                 continue
@@ -165,7 +171,7 @@ def _cleanup(channel_id: str, max_age_seconds: int):
     except Exception as e:
         print(f"[cleanup] upstash fallback error: {e}", file=sys.stderr)
 
-    return {"ok": True, "inspected": inspected, "deleted": deleted, "errors": errors, "cutoff_seconds": cutoff_seconds}
+    return {"ok": True, "inspected": inspected, "deleted": deleted, "errors": errors, "cutoff_seconds": cutoff_seconds, "debug": debug}
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
